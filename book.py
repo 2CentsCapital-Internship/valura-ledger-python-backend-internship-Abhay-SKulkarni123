@@ -44,6 +44,9 @@ class Book:
         # What you have not written yet. An unimplemented handler must not stop
         # the run: the client keeps consuming and tells you the list at the end.
         self.todo: dict[str, int] = defaultdict(int)
+        self.events: dict[str, dict] = {}
+        self.refunded_fees: set[str] = set()
+        self.withdrawals: dict[str, dict] = {}
 
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -74,6 +77,7 @@ class Book:
             # must leave your book exactly as it was.
             return []
         self._post(legs)
+        self.events[eid] = ev
         return legs
 
     def _post(self, legs: list[dict]) -> None:
@@ -98,36 +102,138 @@ class Book:
 
     # -- yours --------------------------------------------------------------
     def on_fee_charged(self, p, ev):
-        raise NotImplementedError("Dr 2010 amount / Cr 1100 amount")
+        amount = money(D(p["amount"]))
+        cid = p["customer_id"]
+
+        return [
+            leg("2010", cid, debit=amount),
+            leg("1100", cid, credit=amount),
+        ]
 
     def on_fee_refund(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 / Cr 2010. The amount is NOT in this payload: look it up "
-            "from the fee_charged event named by refunds_source_id")
+        source_id = p["refunds_source_id"]
+        cid = p["customer_id"]
+
+        source = self.events.get(source_id)
+
+        if source is None or source.get("type") != "fee_charged":
+            raise Rejected()
+
+        if source_id in self.refunded_fees:
+            raise Rejected()
+
+        source_payload = source["payload"]
+
+        if source_payload["customer_id"] != cid:
+            raise Rejected()
+
+        amount = money(D(source_payload["amount"]))
+
+        self.refunded_fees.add(source_id)
+
+        return [
+            leg("1100", cid, debit=amount),
+            leg("2010", cid, credit=amount),
+        ]
 
     def on_interest_credited(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 gross / Cr 2010 customer_share / Cr 4200 the remainder")
+        cid = p["customer_id"]
+        amount = money(D(p["amount"]))
+
+        return [
+            leg("4200", cid, debit=amount),
+            leg("2010", cid, credit=amount),
+        ]
 
     def on_transfer_between_customers(self, p, ev):
-        raise NotImplementedError(
-            "Dr 2010 (from_customer_id) / Cr 2010 (to_customer_id). Both legs "
-            "land on 2010, so the ACCOUNT nets to zero")
+        from_cid = p["from_customer_id"]
+        to_cid = p["to_customer_id"]
+        amount = money(D(p["amount"]))
+
+        return [
+            leg("2010", from_cid, debit=amount),
+            leg("2010", to_cid, credit=amount),
+        ]
 
     def on_fx_deposit(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 usd_at_market_rate / Cr 2010 usd_at_customer_rate / "
-            "Cr 4100 the difference")
+        cid = p["customer_id"]
+
+        market_rate = D(p["market_rate"])
+        customer_rate = D(p["customer_rate"])
+
+        if customer_rate > market_rate:
+            raise Rejected()
+
+        usd_market = money(D(p["usd_at_market_rate"]))
+        usd_customer = money(D(p["usd_at_customer_rate"]))
+        spread = money(usd_market - usd_customer)
+
+        return [
+            leg("1100", cid, debit=usd_market),
+            leg("2010", cid, credit=usd_customer),
+            leg("4100", cid, credit=spread),
+        ]
 
     def on_withdrawal_requested(self, p, ev):
-        raise NotImplementedError("Dr 2010 amount / Cr 2300 amount")
+        withdrawal_id = p["withdrawal_id"]
+        cid = p["customer_id"]
+        amount = money(D(p["amount"]))
+
+        if withdrawal_id in self.withdrawals:
+            raise Rejected()
+
+        self.withdrawals[withdrawal_id] = {
+            "customer_id": cid,
+            "amount": amount,
+            "status": "requested",
+        }
+
+        return [
+            leg("2010", cid, debit=amount),
+            leg("2300", cid, credit=amount),
+        ]
 
     def on_withdrawal_settled(self, p, ev):
-        raise NotImplementedError(
-            "Dr 2300 / Cr 1100. Look up the amount from the request")
+        withdrawal_id = p["withdrawal_id"]
+
+        withdrawal = self.withdrawals.get(withdrawal_id)
+
+        if withdrawal is None:
+            raise Rejected()
+
+        if withdrawal["status"] != "requested":
+            raise Rejected()
+
+        cid = withdrawal["customer_id"]
+        amount = withdrawal["amount"]
+
+        withdrawal["status"] = "settled"
+
+        return [
+            leg("2300", cid, debit=amount),
+            leg("1100", cid, credit=amount),
+        ]
 
     def on_withdrawal_rejected(self, p, ev):
-        raise NotImplementedError("Dr 2300 / Cr 2010")
+        withdrawal_id = p["withdrawal_id"]
+
+        withdrawal = self.withdrawals.get(withdrawal_id)
+
+        if withdrawal is None:
+            raise Rejected()
+
+        if withdrawal["status"] != "requested":
+            raise Rejected()
+
+        cid = withdrawal["customer_id"]
+        amount = withdrawal["amount"]
+
+        withdrawal["status"] = "rejected"
+
+        return [
+            leg("2300", cid, debit=amount),
+            leg("2010", cid, credit=amount),
+        ]
 
     def on_order_placed(self, p, ev):
         raise NotImplementedError(
