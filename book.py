@@ -82,6 +82,7 @@ class Book:
         self.refunded_fees: set[str] = set()
         self.withdrawals: dict[str, dict] = {}
         self.orders: dict[str, dict] = {}
+        self.lots: dict[tuple[str, str], list[dict]] = defaultdict(list)
 
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -325,6 +326,29 @@ class Book:
             "broker_payable_account": tariff["payable_account"],
         }
 
+    def _owned_quantity(self, customer_id, symbol):
+        quantity = ZERO
+
+        for lot in self.lots.get((customer_id, symbol), []):
+            quantity += lot["quantity"]
+
+        return quantity
+
+
+    def _share_hold(self, customer_id, symbol):
+        held = ZERO
+
+        for order in self.orders.values():
+            if (
+                order["customer_id"] == customer_id
+                and order["side"] == "sell"
+                and order["symbol"] == symbol
+                and order["status"] == "open"
+            ):
+                held += order["remaining_quantity"]
+
+        return held
+
     def on_order_placed(self, p, ev):
         order_id = p["order_id"]
 
@@ -349,6 +373,14 @@ class Book:
                 quantity * limit_price + est_charges
             )
 
+        if side == "sell":
+            owned = self._owned_quantity(cid, symbol)
+            held = self._share_hold(cid, symbol)
+            available = owned - held
+
+            if quantity > available:
+                raise Rejected()
+
         self.orders[order_id] = {
             "order_id": order_id,
             "customer_id": cid,
@@ -365,6 +397,22 @@ class Book:
         }
 
         return []
+
+    def _add_buy_lot(self, p, ev):
+        cid = p["customer_id"]
+        symbol = p["symbol"]
+        quantity = D(p["quantity"])
+        cost = money(D(p["principal"]))
+
+        if quantity <= ZERO:
+            raise Rejected()
+
+        self.lots[(cid, symbol)].append({
+            "event_id": ev["event_id"],
+            "trade_id": p["trade_id"],
+            "quantity": quantity,
+            "cost": cost,
+        })
 
     def _buy_fill_legs(self, p):
         cid = p["customer_id"]
@@ -443,6 +491,7 @@ class Book:
             hold_before - release
         )
 
+        self._add_buy_lot(p, ev)
         return self._buy_fill_legs(p)
 
 
@@ -467,6 +516,7 @@ class Book:
         order["remaining_cash_hold"] = ZERO
         order["status"] = "filled"
 
+        self._add_buy_lot(p, ev)
         return self._buy_fill_legs(p)
 
     def on_trade_settled(self, p, ev):
@@ -514,6 +564,31 @@ class Book:
             "on your LOT BOOK too. A reversed buy whose lot you leave behind "
             "balances perfectly and corrupts every later cost basis")
 
+    def _positions_for_customer(self, customer_id):
+        positions = {}
+
+        for (cid, symbol), lots in self.lots.items():
+            if cid != customer_id:
+                continue
+
+            quantity = ZERO
+            cost_basis = ZERO
+
+            for lot in lots:
+                quantity += lot["quantity"]
+                cost_basis += lot["cost"]
+
+            if quantity != ZERO:
+                positions[symbol] = {
+                    "quantity": str(quantity),
+                    "cost_basis": str(money(cost_basis)),
+                }
+
+        return {
+            symbol: positions[symbol]
+            for symbol in sorted(positions)
+        }
+
     # -- reporting ----------------------------------------------------------
     def snapshot(self) -> dict:
         """What a checkpoint_request wants: your whole state, right now.
@@ -531,6 +606,9 @@ class Book:
         customer_ids = {cid for cid, _acct in self.balances.keys()}
         customer_ids.update(
             order["customer_id"] for order in self.orders.values()
+        )
+        customer_ids.update(
+            cid for cid, _symbol in self.lots.keys()
         )
 
         # Calculate active BUY cash holds.
@@ -552,7 +630,7 @@ class Book:
             customers[cid] = {
                 "wallet_cash": str(money(wallet_cash)),
                 "cash_hold": str(money(cash_holds[cid])),
-                "positions": {},
+                "positions": self._positions_for_customer(cid),
             }
 
         return {
