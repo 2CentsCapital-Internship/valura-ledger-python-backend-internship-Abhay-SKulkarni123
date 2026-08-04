@@ -24,6 +24,40 @@ from decimal import Decimal, ROUND_HALF_UP
 
 D = Decimal
 ZERO = D("0.00")
+BPS = D("0.0001")
+
+TARIFFS = {
+    "BRK-A": {
+        "asset_classes": {"equity", "etf"},
+        "brokerage_bps": D("20"),
+        "custody_bps": D("4"),
+        "broker_cost_bps": D("9"),
+        "custody_cost_bps": D("2"),
+        "min_fee": D("1.00"),
+        "ticket": D("0.35"),
+        "payable_account": "2411",
+    },
+    "BRK-B": {
+        "asset_classes": {"equity", "bond"},
+        "brokerage_bps": D("15"),
+        "custody_bps": D("5"),
+        "broker_cost_bps": D("8"),
+        "custody_cost_bps": D("3"),
+        "min_fee": D("2.50"),
+        "ticket": D("3.00"),
+        "payable_account": "2412",
+    },
+    "BRK-C": {
+        "asset_classes": {"etf", "bond"},
+        "brokerage_bps": D("25"),
+        "custody_bps": D("3"),
+        "broker_cost_bps": D("12"),
+        "custody_cost_bps": D("1"),
+        "min_fee": D("0.50"),
+        "ticket": D("0.20"),
+        "payable_account": "2413",
+    },
+}
 
 
 def money(x: Decimal) -> Decimal:
@@ -47,6 +81,7 @@ class Book:
         self.events: dict[str, dict] = {}
         self.refunded_fees: set[str] = set()
         self.withdrawals: dict[str, dict] = {}
+        self.orders: dict[str, dict] = {}
 
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -81,10 +116,12 @@ class Book:
         return legs
 
     def _post(self, legs: list[dict]) -> None:
-        dr = sum(D(l["debit"]) for l in legs)
-        cr = sum(D(l["credit"]) for l in legs)
+        dr = sum((D(l["debit"]) for l in legs), ZERO)
+        cr = sum((D(l["credit"]) for l in legs), ZERO)
+
         if money(dr) != money(cr):
             raise AssertionError(f"unbalanced: dr {dr} cr {cr}")
+        
         for l in legs:
             self.balances[(l["customer_id"], l["account"])] += (
                 D(l["debit"]) - D(l["credit"]))
@@ -138,11 +175,15 @@ class Book:
 
     def on_interest_credited(self, p, ev):
         cid = p["customer_id"]
-        amount = money(D(p["amount"]))
+
+        gross = money(D(p["gross_amount"]))
+        customer_share = money(D(p["customer_share"]))
+        firm_share = money(gross - customer_share)
 
         return [
-            leg("4200", cid, debit=amount),
-            leg("2010", cid, credit=amount),
+            leg("1100", cid, debit=gross),
+            leg("2010", cid, credit=customer_share),
+            leg("4200", cid, credit=firm_share),
         ]
 
     def on_transfer_between_customers(self, p, ev):
@@ -235,28 +276,218 @@ class Book:
             leg("2010", cid, credit=amount),
         ]
 
+    def _trade_fees(self, principal, broker, partner_rate):
+        principal = money(D(principal))
+        partner_rate = D(partner_rate)
+
+        tariff = TARIFFS.get(broker)
+
+        if tariff is None:
+            raise Rejected()
+
+        brokerage = money(
+            max(
+                principal * tariff["brokerage_bps"] * BPS,
+                tariff["min_fee"],
+            )
+        )
+
+        custody = money(
+            principal * tariff["custody_bps"] * BPS
+        )
+
+        regulatory = money(
+            principal * D("8") * BPS
+        )
+
+        broker_cost = money(
+            principal * tariff["broker_cost_bps"] * BPS
+            + tariff["ticket"]
+        )
+
+        custody_cost = money(
+            principal * tariff["custody_cost_bps"] * BPS
+        )
+
+        margin = brokerage + custody - broker_cost - custody_cost
+
+        partner_share = money(
+            partner_rate * max(margin, ZERO)
+        )
+
+        return {
+            "brokerage": brokerage,
+            "custody": custody,
+            "regulatory": regulatory,
+            "broker_cost": broker_cost,
+            "custody_cost": custody_cost,
+            "partner_share": partner_share,
+            "broker_payable_account": tariff["payable_account"],
+        }
+
     def on_order_placed(self, p, ev):
-        raise NotImplementedError(
-            "No legs. A placement moves no money: it creates a hold, which is "
-            "reported at checkpoints and never posted")
+        order_id = p["order_id"]
+
+        if order_id in self.orders:
+            raise Rejected()
+
+        cid = p["customer_id"]
+        side = p["side"]
+        symbol = p["symbol"]
+        quantity = D(p["quantity"])
+        limit_price = D(p["limit_price"])
+        asset_class = p["asset_class"]
+        est_charges = money(D(p["est_charges"]))
+
+        if side not in ("buy", "sell"):
+            raise Rejected()
+
+        cash_hold = ZERO
+
+        if side == "buy":
+            cash_hold = money(
+                quantity * limit_price + est_charges
+            )
+
+        self.orders[order_id] = {
+            "order_id": order_id,
+            "customer_id": cid,
+            "side": side,
+            "symbol": symbol,
+            "quantity": quantity,
+            "remaining_quantity": quantity,
+            "limit_price": limit_price,
+            "asset_class": asset_class,
+            "est_charges": est_charges,
+            "original_cash_hold": cash_hold,
+            "remaining_cash_hold": cash_hold,
+            "status": "open",
+        }
+
+        return []
+
+    def _buy_fill_legs(self, p):
+        cid = p["customer_id"]
+        principal = money(D(p["principal"]))
+
+        fees = self._trade_fees(
+            principal,
+            p["broker"],
+            p["partner_rate"],
+        )
+
+        brokerage = fees["brokerage"]
+        custody = fees["custody"]
+        regulatory = fees["regulatory"]
+        broker_cost = fees["broker_cost"]
+        custody_cost = fees["custody_cost"]
+        partner_share = fees["partner_share"]
+
+        customer_total = money(
+            principal + brokerage + custody + regulatory
+        )
+
+        return [
+            leg("2010", cid, debit=customer_total),
+            leg("2350", cid, credit=principal),
+
+            leg("1200", cid, debit=principal),
+            leg("2100", cid, credit=principal),
+
+            leg("5000", cid, debit=broker_cost),
+            leg("4000", cid, credit=brokerage),
+
+            leg("5010", cid, debit=custody_cost),
+            leg("4010", cid, credit=custody),
+
+            leg("5100", cid, debit=partner_share),
+            leg("2400", cid, credit=regulatory),
+
+            leg(
+                fees["broker_payable_account"],
+                cid,
+                credit=broker_cost,
+            ),
+            leg("2420", cid, credit=custody_cost),
+            leg("2430", cid, credit=partner_share),
+        ]
 
     def on_order_partially_filled(self, p, ev):
-        return self.on_order_filled(p, ev)
+        if p["side"] != "buy":
+            raise NotImplementedError("SELL fills require FIFO lots")
+
+        order = self.orders.get(p["order_id"])
+
+        if order is None:
+            raise Rejected()
+
+        fill_quantity = D(p["quantity"])
+
+        if fill_quantity <= ZERO:
+            raise Rejected()
+
+        if fill_quantity >= order["remaining_quantity"]:
+            raise Rejected()
+
+        remaining_before = order["remaining_quantity"]
+        hold_before = order["remaining_cash_hold"]
+
+        # Release the same proportion of the CURRENT remaining hold
+        # as the proportion of remaining quantity filled.
+        release = money(
+            hold_before * fill_quantity / remaining_before
+        )
+
+        order["remaining_quantity"] -= fill_quantity
+        order["remaining_cash_hold"] = money(
+            hold_before - release
+        )
+
+        return self._buy_fill_legs(p)
+
 
     def on_order_filled(self, p, ev):
-        raise NotImplementedError(
-            "buy:  Dr 2010 principal+commission, Dr 1200 principal / "
-            "Cr 2350 principal, Cr 2100 principal, Cr 4000 commission. "
-            "sell: Dr 1150 principal, Dr 2100 FIFO cost / Cr 2010 "
-            "principal-commission-reg, Cr 1200 cost, Cr 4000 commission, "
-            "Cr 2400 reg. Cash does NOT move on the trade date")
+        if p["side"] != "buy":
+            raise NotImplementedError("SELL fills require FIFO lots")
+
+        order = self.orders.get(p["order_id"])
+
+        if order is None:
+            raise Rejected()
+
+        fill_quantity = D(p["quantity"])
+
+        if fill_quantity <= ZERO:
+            raise Rejected()
+
+        if fill_quantity != order["remaining_quantity"]:
+            raise Rejected()
+
+        order["remaining_quantity"] = ZERO
+        order["remaining_cash_hold"] = ZERO
+        order["status"] = "filled"
+
+        return self._buy_fill_legs(p)
 
     def on_trade_settled(self, p, ev):
         raise NotImplementedError(
             "buy: Dr 2350 / Cr 1100.  sell: Dr 1100 / Cr 1150")
 
     def on_order_cancelled(self, p, ev):
-        raise NotImplementedError("No legs. Release the remaining hold")
+        order_id = p["order_id"]
+
+        order = self.orders.get(order_id)
+
+        if order is None:
+            raise Rejected()
+
+        if order["status"] != "open":
+            raise Rejected()
+
+        order["remaining_cash_hold"] = ZERO
+        order["status"] = "cancelled"
+
+        return []
 
     def on_order_rejected(self, p, ev):
         return self.on_order_cancelled(p, ev)
@@ -292,22 +523,47 @@ class Book:
         liabilities carry a negative sign.
         """
         tb: dict[str, Decimal] = defaultdict(lambda: ZERO)
+
         for (_cid, acct), bal in self.balances.items():
             tb[acct] += bal
 
+        # A customer can exist because of either ledger activity or an open order.
+        customer_ids = {cid for cid, _acct in self.balances.keys()}
+        customer_ids.update(
+            order["customer_id"] for order in self.orders.values()
+        )
+
+        # Calculate active BUY cash holds.
+        cash_holds: dict[str, Decimal] = defaultdict(lambda: ZERO)
+
+        for order in self.orders.values():
+            if order["side"] == "buy" and order["status"] == "open":
+                cash_holds[order["customer_id"]] += order["remaining_cash_hold"]
+
         customers: dict[str, dict] = {}
-        for (cid, acct), bal in self.balances.items():
-            c = customers.setdefault(cid, {"wallet_cash": ZERO,
-                                           "cash_hold": ZERO, "positions": {}})
-            if acct == "2010":
-                c["wallet_cash"] += -bal          # a liability, so credit-positive
+
+        for cid in customer_ids:
+            wallet_cash = ZERO
+
+            for (balance_cid, acct), bal in self.balances.items():
+                if balance_cid == cid and acct == "2010":
+                    wallet_cash += -bal
+
+            customers[cid] = {
+                "wallet_cash": str(money(wallet_cash)),
+                "cash_hold": str(money(cash_holds[cid])),
+                "positions": {},
+            }
 
         return {
-            "trial_balance": {a: str(money(v)) for a, v in sorted(tb.items())},
-            "customers": {cid: {"wallet_cash": str(money(c["wallet_cash"])),
-                                "cash_hold": str(money(c["cash_hold"])),
-                                "positions": c["positions"]}
-                          for cid, c in sorted(customers.items())},
+            "trial_balance": {
+                acct: str(money(value))
+                for acct, value in sorted(tb.items())
+            },
+            "customers": {
+                cid: customers[cid]
+                for cid in sorted(customers)
+            },
         }
 
 
