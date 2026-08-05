@@ -3710,5 +3710,194 @@ class TestResilience(unittest.TestCase):
         for event in events:
             self.assertIn(event["event_id"], b.events)
 
+class TestCheckpointState(unittest.TestCase):
+
+    def test_trial_balance_aggregates_across_customers(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "cp-dep-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "cp-dep-2",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C2",
+                "amount": "250.00",
+            },
+        })
+
+        snap = b.snapshot()
+
+        self.assertEqual(snap["trial_balance"]["1100"], "350.00")
+        self.assertEqual(snap["trial_balance"]["2010"], "-350.00")
+        self.assertEqual(
+            snap["customers"]["C1"]["wallet_cash"],
+            "100.00",
+        )
+        self.assertEqual(
+            snap["customers"]["C2"]["wallet_cash"],
+            "250.00",
+        )
+
+    def test_zero_balance_accounts_remain_in_trial_balance(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "cp-dep-zero",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "cp-rev-zero",
+            "type": "reversal",
+            "payload": {
+                "reverses_event_id": "cp-dep-zero",
+                "reason": "checkpoint zero-balance test",
+            },
+        })
+
+        snap = b.snapshot()
+
+        self.assertIn("1100", snap["trial_balance"])
+        self.assertIn("2010", snap["trial_balance"])
+        self.assertEqual(snap["trial_balance"]["1100"], "0.00")
+        self.assertEqual(snap["trial_balance"]["2010"], "0.00")
+
+    def test_checkpoint_reports_wallet_hold_and_position(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "cp-deposit",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "3000.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "cp-buy-order",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "CP-BUY-1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "cp-buy-fill",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "CP-BUY-1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "price": "100.00",
+                "principal": "1000.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "CP-T1",
+            },
+        })
+
+        b.apply({
+            "event_id": "cp-open-order",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "CP-BUY-2",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "XYZ",
+                "quantity": "5",
+                "limit_price": "50.00",
+                "asset_class": "equity",
+                "est_charges": "5.00",
+            },
+        })
+
+        snap = b.snapshot()
+        customer = snap["customers"]["C1"]
+
+        self.assertEqual(customer["wallet_cash"], "1996.80")
+        self.assertEqual(customer["cash_hold"], "255.00")
+
+        self.assertEqual(
+            customer["positions"]["ACME"],
+            {
+                "quantity": "10.00",
+                "cost_basis": "1000.00",
+            },
+        )
+
+        self.assertNotIn("XYZ", customer["positions"])
+
+    def test_snapshot_is_deterministic_and_does_not_mutate_book(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "cp-det-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C2",
+                "amount": "200.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "cp-det-2",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        balances_before = dict(b.balances)
+        orders_before = {
+            key: dict(value)
+            for key, value in b.orders.items()
+        }
+        lots_before = {
+            key: [dict(lot) for lot in value]
+            for key, value in b.lots.items()
+        }
+
+        first = b.snapshot()
+        second = b.snapshot()
+
+        self.assertEqual(first, second)
+        self.assertEqual(dict(b.balances), balances_before)
+        self.assertEqual(b.orders, orders_before)
+
+        lots_after = {
+            key: [dict(lot) for lot in value]
+            for key, value in b.lots.items()
+        }
+        self.assertEqual(lots_after, lots_before)
+
+        self.assertEqual(
+            list(first["customers"].keys()),
+            ["C1", "C2"],
+        )
+
 if __name__ == "__main__":
     unittest.main()
