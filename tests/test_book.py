@@ -1,7 +1,7 @@
 import unittest
 from decimal import Decimal as D
 
-from book import Book
+from book import Book, Rejected
 
 
 class TestCashEvents(unittest.TestCase):
@@ -2622,6 +2622,311 @@ class TestCorporateActions(unittest.TestCase):
         self.assertEqual(
             b.lots[("C2", "OLD")][0]["cost"],
             D("800.00"),
+        )
+
+class TestReversals(unittest.TestCase):
+
+    def test_deposit_reversal_exactly_inverts_journal(self):
+        b = Book()
+
+        original = b.apply({
+            "event_id": "dep-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        reversal = b.apply({
+            "event_id": "rev-1",
+            "type": "reversal",
+            "payload": {
+                "reverses_event_id": "dep-1",
+                "reason": "mistake",
+            },
+        })
+
+        self.assertEqual(len(original), len(reversal))
+
+        for orig, rev in zip(original, reversal):
+            self.assertEqual(orig["account"], rev["account"])
+            self.assertEqual(
+                orig["customer_id"],
+                rev["customer_id"],
+            )
+            self.assertEqual(orig["debit"], rev["credit"])
+            self.assertEqual(orig["credit"], rev["debit"])
+
+        snap = b.snapshot()
+
+        self.assertEqual(
+            snap["customers"]["C1"]["wallet_cash"],
+            "0.00",
+        )
+        self.assertEqual(
+            snap["trial_balance"]["1100"],
+            "0.00",
+        )
+        self.assertEqual(
+            snap["trial_balance"]["2010"],
+            "0.00",
+        )
+
+    def test_unknown_reversal_is_rejected_without_state_change(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "dep-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        before = b.snapshot()
+
+        result = b.apply({
+            "event_id": "rev-1",
+            "type": "reversal",
+            "payload": {
+                "reverses_event_id": "does-not-exist",
+                "reason": "mistake",
+            },
+        })
+
+        self.assertEqual(result, [])
+        self.assertEqual(b.snapshot(), before)
+        self.assertNotIn("rev-1", b.events)
+
+    def test_same_event_cannot_be_reversed_twice(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "dep-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "rev-1",
+            "type": "reversal",
+            "payload": {
+                "reverses_event_id": "dep-1",
+                "reason": "first reversal",
+            },
+        })
+
+        before = b.snapshot()
+
+        result = b.apply({
+            "event_id": "rev-2",
+            "type": "reversal",
+            "payload": {
+                "reverses_event_id": "dep-1",
+                "reason": "second reversal",
+            },
+        })
+
+        self.assertEqual(result, [])
+        self.assertEqual(b.snapshot(), before)
+        self.assertNotIn("rev-2", b.events)
+
+    def test_duplicate_reversal_event_id_is_idempotent(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "dep-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        event = {
+            "event_id": "rev-1",
+            "type": "reversal",
+            "payload": {
+                "reverses_event_id": "dep-1",
+                "reason": "mistake",
+            },
+        }
+
+        first = b.apply(event)
+        before = b.snapshot()
+
+        second = b.apply(event)
+
+        self.assertTrue(first)
+        self.assertEqual(second, [])
+        self.assertEqual(b.snapshot(), before)
+
+    def test_buy_fill_reversal_removes_fifo_lot_without_restoring_hold(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "dep-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "2000.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "ord-1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "BUY-1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "fill-1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "BUY-1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "price": "100.00",
+                "principal": "1000.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T1",
+            },
+        })
+
+        b.apply({
+            "event_id": "rev-1",
+            "type": "reversal",
+            "payload": {
+                "reverses_event_id": "fill-1",
+                "reason": "bad fill",
+            },
+        })
+
+        snap = b.snapshot()
+
+        self.assertNotIn(
+            "ACME",
+            snap["customers"]["C1"]["positions"],
+        )
+
+        self.assertEqual(
+            snap["customers"]["C1"]["cash_hold"],
+            "0.00",
+        )
+
+        self.assertEqual(
+            b.orders["BUY-1"]["status"],
+            "filled",
+        )
+        self.assertEqual(
+            b.orders["BUY-1"]["remaining_quantity"],
+            D("0.00"),
+        )
+        self.assertEqual(
+            b.orders["BUY-1"]["remaining_cash_hold"],
+            D("0.00"),
+        )
+
+    def test_sell_fill_reversal_restores_exact_fifo_lots(self):
+        b = Book()
+
+        b.lots[("C1", "ACME")] = [
+            {
+                "event_id": "buy-1",
+                "trade_id": "T1",
+                "quantity": D("10"),
+                "cost": D("1000.00"),
+            },
+            {
+                "event_id": "buy-2",
+                "trade_id": "T2",
+                "quantity": D("5"),
+                "cost": D("600.00"),
+            },
+        ]
+
+        b.apply({
+            "event_id": "ord-1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "SELL-1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "12",
+                "limit_price": "120.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "sell-1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "SELL-1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "12",
+                "price": "120.00",
+                "principal": "1440.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "ST1",
+            },
+        })
+
+        b.apply({
+            "event_id": "rev-1",
+            "type": "reversal",
+            "payload": {
+                "reverses_event_id": "sell-1",
+                "reason": "bad sell",
+            },
+        })
+
+        lots = b.lots[("C1", "ACME")]
+
+        self.assertEqual(len(lots), 2)
+
+        self.assertEqual(lots[0]["event_id"], "buy-1")
+        self.assertEqual(lots[0]["trade_id"], "T1")
+        self.assertEqual(lots[0]["quantity"], D("10"))
+        self.assertEqual(lots[0]["cost"], D("1000.00"))
+
+        self.assertEqual(lots[1]["event_id"], "buy-2")
+        self.assertEqual(lots[1]["trade_id"], "T2")
+        self.assertEqual(lots[1]["quantity"], D("5"))
+        self.assertEqual(lots[1]["cost"], D("600.00"))
+
+        position = b.snapshot()["customers"]["C1"]["positions"]["ACME"]
+
+        self.assertEqual(position["quantity"], "15.00")
+        self.assertEqual(position["cost_basis"], "1600.00")
+
+        self.assertEqual(
+            b.orders["SELL-1"]["status"],
+            "filled",
         )
 
 if __name__ == "__main__":

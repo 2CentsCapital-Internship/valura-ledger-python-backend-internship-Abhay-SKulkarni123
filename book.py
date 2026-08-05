@@ -79,6 +79,10 @@ class Book:
         # the run: the client keeps consuming and tells you the list at the end.
         self.todo: dict[str, int] = defaultdict(int)
         self.events: dict[str, dict] = {}
+        self.event_legs: dict[str, list[dict]] = {}
+        self.lot_mutations: dict[str, dict] = {}
+        self._last_fifo_consumed: list[dict] = []
+        self.reversed_events: set[str] = set()
         self.refunded_fees: set[str] = set()
         self.withdrawals: dict[str, dict] = {}
         self.orders: dict[str, dict] = {}
@@ -115,6 +119,7 @@ class Book:
             return []
         self._post(legs)
         self.events[eid] = ev
+        self.event_legs[eid] = [dict(x) for x in legs]
         return legs
 
     def _post(self, legs: list[dict]) -> None:
@@ -417,6 +422,7 @@ class Book:
 
         remaining_to_sell = quantity
         cost_relieved = ZERO
+        consumed = []
 
         while remaining_to_sell > ZERO:
             lot = lots[0]
@@ -438,6 +444,14 @@ class Book:
                     / lot_quantity
                 )
 
+            # Preserve exactly what this sale removed.
+            consumed.append({
+                "event_id": lot.get("event_id"),
+                "trade_id": lot.get("trade_id"),
+                "quantity": consumed_quantity,
+                "cost": consumed_cost,
+            })
+
             cost_relieved += consumed_cost
 
             lot["quantity"] -= consumed_quantity
@@ -450,6 +464,7 @@ class Book:
             if lot["quantity"] == ZERO:
                 lots.pop(0)
 
+        self._last_fifo_consumed = consumed
         return money(cost_relieved)
 
     def _add_buy_lot(self, p, ev):
@@ -467,6 +482,81 @@ class Book:
             "quantity": quantity,
             "cost": cost,
         })
+
+        self.lot_mutations[ev["event_id"]] = {
+            "type": "buy",
+            "customer_id": cid,
+            "symbol": symbol,
+            "quantity": quantity,
+            "cost": cost,
+        }
+
+    def _reverse_buy_lot(self, original_event_id, mutation):
+        key = (
+            mutation["customer_id"],
+            mutation["symbol"],
+        )
+
+        lots = self.lots.get(key, [])
+
+        for index, lot in enumerate(lots):
+            if lot.get("event_id") == original_event_id:
+                expected_quantity = mutation["quantity"]
+                expected_cost = mutation["cost"]
+
+                # If a later SELL has already consumed part/all of this lot,
+                # blindly removing it would corrupt the current lot book.
+                if (
+                    lot["quantity"] != expected_quantity
+                    or money(lot["cost"]) != money(expected_cost)
+                ):
+                    raise Rejected()
+
+                lots.pop(index)
+
+                if not lots:
+                    self.lots.pop(key, None)
+
+                return
+
+        raise Rejected()
+
+    def _reverse_sell_lots(self, mutation):
+        key = (
+            mutation["customer_id"],
+            mutation["symbol"],
+        )
+
+        lots = self.lots[key]
+        consumed = mutation["consumed"]
+
+        # A SELL always consumes from the front of the FIFO queue.
+        # Restore those fragments to the front in their original order.
+        for fragment in reversed(consumed):
+            event_id = fragment.get("event_id")
+            trade_id = fragment.get("trade_id")
+            quantity = fragment["quantity"]
+            cost = fragment["cost"]
+
+            if (
+                lots
+                and lots[0].get("event_id") == event_id
+                and lots[0].get("trade_id") == trade_id
+            ):
+                # The SELL partially consumed this lot and its remainder
+                # is still at the front. Recombine the fragment.
+                lots[0]["quantity"] += quantity
+                lots[0]["cost"] = money(
+                    lots[0]["cost"] + cost
+                )
+            else:
+                # The SELL consumed this lot completely.
+                lots.insert(0, {
+                    "event_id": event_id,
+                    "trade_id": trade_id,
+                    "quantity": quantity,
+                    "cost": money(cost),
+                })
 
     def _buy_fill_legs(self, p):
         cid = p["customer_id"]
@@ -610,14 +700,22 @@ class Book:
                 fill_quantity,
             )
 
+            self.lot_mutations[ev["event_id"]] = {
+                "type": "sell",
+                "customer_id": p["customer_id"],
+                "symbol": p["symbol"],
+                "consumed": [
+                    dict(x) for x in self._last_fifo_consumed
+                ],
+            }
+
             order["remaining_quantity"] -= fill_quantity
             self._record_trade(p)
+
             return self._sell_fill_legs(
                 p,
                 fifo_cost,
             )
-
-        raise Rejected()
 
 
     def on_order_filled(self, p, ev):
@@ -656,15 +754,23 @@ class Book:
                 fill_quantity,
             )
 
+            self.lot_mutations[ev["event_id"]] = {
+                "type": "sell",
+                "customer_id": p["customer_id"],
+                "symbol": p["symbol"],
+                "consumed": [
+                    dict(x) for x in self._last_fifo_consumed
+                ],
+            }
+
             order["remaining_quantity"] = ZERO
             order["status"] = "filled"
             self._record_trade(p)
+
             return self._sell_fill_legs(
                 p,
                 fifo_cost,
             )
-
-        raise Rejected()
 
     def _record_trade(self, p):
         trade_id = p.get("trade_id")
@@ -931,10 +1037,51 @@ class Book:
         return []
 
     def on_reversal(self, p, ev):
-        raise NotImplementedError(
-            "Post the exact inverse of the original's legs, and undo its effect "
-            "on your LOT BOOK too. A reversed buy whose lot you leave behind "
-            "balances perfectly and corrupts every later cost basis")
+        original_id = p["reverses_event_id"]
+
+        if original_id not in self.events:
+            raise Rejected()
+
+        if original_id in self.reversed_events:
+            raise Rejected()
+
+        original_legs = self.event_legs.get(original_id)
+
+        if original_legs is None:
+            raise Rejected()
+
+        mutation = self.lot_mutations.get(original_id)
+
+        # Undo the lot book first. If this cannot safely be done,
+        # reject before any journal posting occurs.
+        if mutation is not None:
+            if mutation["type"] == "buy":
+                self._reverse_buy_lot(
+                    original_id,
+                    mutation,
+                )
+
+            elif mutation["type"] == "sell":
+                self._reverse_sell_lots(mutation)
+
+            else:
+                raise Rejected()
+
+        inverse = []
+
+        for original_leg in original_legs:
+            inverse.append(
+                leg(
+                    original_leg["account"],
+                    original_leg["customer_id"],
+                    debit=D(original_leg["credit"]),
+                    credit=D(original_leg["debit"]),
+                )
+            )
+
+        self.reversed_events.add(original_id)
+
+        return inverse
 
     def _positions_for_customer(self, customer_id):
         positions = {}
