@@ -2929,5 +2929,786 @@ class TestReversals(unittest.TestCase):
             "filled",
         )
 
+class TestResilience(unittest.TestCase):
+
+    def test_rejected_event_id_remains_seen(self):
+        b = Book()
+
+        bad = {
+            "event_id": "bad-fx-1",
+            "type": "fx_deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount_foreign": "100.00",
+                "currency": "EUR",
+                "market_rate": "1.10",
+                "customer_rate": "1.20",
+                "usd_at_market_rate": "110.00",
+                "usd_at_customer_rate": "120.00",
+            },
+        }
+
+        result = b.apply(bad)
+
+        self.assertEqual(result, [])
+        self.assertIn("bad-fx-1", b.seen)
+        self.assertNotIn("bad-fx-1", b.events)
+
+    def test_redelivery_of_rejected_event_stays_rejected(self):
+        b = Book()
+
+        bad = {
+            "event_id": "bad-fx-1",
+            "type": "fx_deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount_foreign": "100.00",
+                "currency": "EUR",
+                "market_rate": "1.10",
+                "customer_rate": "1.20",
+                "usd_at_market_rate": "110.00",
+                "usd_at_customer_rate": "120.00",
+            },
+        }
+
+        self.assertEqual(b.apply(bad), [])
+        before = b.snapshot()
+
+        # Same event_id, but now with content that would otherwise be valid.
+        conflicting_redelivery = {
+            "event_id": "bad-fx-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "9999.00",
+            },
+        }
+
+        result = b.apply(conflicting_redelivery)
+
+        self.assertEqual(result, [])
+        self.assertEqual(b.snapshot(), before)
+        self.assertNotIn("bad-fx-1", b.events)
+
+    def test_conflicting_duplicate_of_posted_event_first_delivery_wins(self):
+        b = Book()
+
+        first = {
+            "event_id": "dup-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        }
+
+        conflicting = {
+            "event_id": "dup-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "9999.00",
+            },
+        }
+
+        first_legs = b.apply(first)
+        before = b.snapshot()
+
+        second_legs = b.apply(conflicting)
+
+        self.assertTrue(first_legs)
+        self.assertEqual(second_legs, [])
+        self.assertEqual(b.snapshot(), before)
+
+        self.assertEqual(
+            b.snapshot()["customers"]["C1"]["wallet_cash"],
+            "100.00",
+        )
+
+        # The accepted audit event must remain the FIRST delivery.
+        self.assertEqual(
+            b.events["dup-1"]["payload"]["amount"],
+            "100.00",
+        )
+
+    def test_oversell_fill_is_atomic_and_does_not_consume_fifo(self):
+        b = Book()
+
+        b.lots[("C1", "ACME")] = [
+            {
+                "event_id": "buy-1",
+                "trade_id": "T1",
+                "quantity": D("10"),
+                "cost": D("1000.00"),
+            },
+        ]
+
+        before_lots = [
+            dict(lot) for lot in b.lots[("C1", "ACME")]
+        ]
+        before = b.snapshot()
+
+        result = b.apply({
+            "event_id": "sell-bad-1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "MISSING-ORDER",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "12",
+                "price": "120.00",
+                "principal": "1440.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "ST-BAD",
+            },
+        })
+
+        self.assertEqual(result, [])
+        self.assertEqual(b.snapshot(), before)
+
+        self.assertEqual(
+            b.lots[("C1", "ACME")],
+            before_lots,
+        )
+
+        self.assertIn("sell-bad-1", b.seen)
+        self.assertNotIn("sell-bad-1", b.events)
+
+    def test_oversell_order_rejection_leaves_state_unchanged(self):
+        b = Book()
+
+        b.lots[("C1", "ACME")] = [
+            {
+                "event_id": "buy-1",
+                "trade_id": "T1",
+                "quantity": D("10"),
+                "cost": D("1000.00"),
+            },
+        ]
+
+        before = b.snapshot()
+        before_lots = [
+            dict(lot) for lot in b.lots[("C1", "ACME")]
+        ]
+
+        result = b.apply({
+            "event_id": "oversell-1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "SELL-1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "11",
+                "limit_price": "120.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        self.assertEqual(result, [])
+        self.assertEqual(b.snapshot(), before)
+
+        self.assertEqual(
+            b.lots[("C1", "ACME")],
+            before_lots,
+        )
+
+        self.assertNotIn("SELL-1", b.orders)
+
+        # Rejected IDs are still seen.
+        self.assertIn("oversell-1", b.seen)
+
+    def test_invalid_partial_fill_does_not_mutate_buy_order(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "dep-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "2000.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "ord-1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "BUY-1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        before_snapshot = b.snapshot()
+        before_order = dict(b.orders["BUY-1"])
+        before_lots = [
+            dict(x) for x in b.lots.get(("C1", "ACME"), [])
+        ]
+
+        # Fill exceeds the order's remaining quantity.
+        result = b.apply({
+            "event_id": "bad-fill-1",
+            "type": "order_partially_filled",
+            "payload": {
+                "order_id": "BUY-1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "11",
+                "price": "100.00",
+                "principal": "1100.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "BAD-T1",
+            },
+        })
+
+        self.assertEqual(result, [])
+        self.assertEqual(b.snapshot(), before_snapshot)
+        self.assertEqual(b.orders["BUY-1"], before_order)
+        self.assertEqual(
+            b.lots.get(("C1", "ACME"), []),
+            before_lots,
+        )
+        self.assertNotIn("BAD-T1", b.trades)
+
+        # Rejected delivery is nevertheless seen.
+        self.assertIn("bad-fill-1", b.seen)
+
+    def test_invalid_partial_fill_does_not_mutate_sell_order_or_fifo(self):
+        b = Book()
+
+        b.lots[("C1", "ACME")] = [
+            {
+                "event_id": "buy-1",
+                "trade_id": "T1",
+                "quantity": D("10"),
+                "cost": D("1000.00"),
+            },
+        ]
+
+        b.apply({
+            "event_id": "ord-1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "SELL-1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "8",
+                "limit_price": "120.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        before_snapshot = b.snapshot()
+        before_order = dict(b.orders["SELL-1"])
+        before_lots = [
+            dict(x) for x in b.lots[("C1", "ACME")]
+        ]
+
+        # Order only has 8 shares remaining, so 9 must reject.
+        result = b.apply({
+            "event_id": "bad-fill-1",
+            "type": "order_partially_filled",
+            "payload": {
+                "order_id": "SELL-1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "9",
+                "price": "120.00",
+                "principal": "1080.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "BAD-T1",
+            },
+        })
+
+        self.assertEqual(result, [])
+        self.assertEqual(b.snapshot(), before_snapshot)
+        self.assertEqual(b.orders["SELL-1"], before_order)
+        self.assertEqual(
+            b.lots[("C1", "ACME")],
+            before_lots,
+        )
+        self.assertNotIn("BAD-T1", b.trades)
+        self.assertIn("bad-fill-1", b.seen)
+
+    def test_duplicate_trade_id_fill_rejection_is_atomic(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "dep-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "5000.00",
+            },
+        })
+
+        # First BUY order.
+        b.apply({
+            "event_id": "ord-1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "BUY-1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "5",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        # This creates trade_id T-DUP.
+        first_fill = b.apply({
+            "event_id": "fill-1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "BUY-1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "5",
+                "price": "100.00",
+                "principal": "500.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T-DUP",
+            },
+        })
+
+        self.assertTrue(first_fill)
+        self.assertIn("T-DUP", b.trades)
+
+        # Second independent BUY order.
+        b.apply({
+            "event_id": "ord-2",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "BUY-2",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "3",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        before_snapshot = b.snapshot()
+        before_order = dict(b.orders["BUY-2"])
+        before_lots = [
+            dict(x) for x in b.lots[("C1", "ACME")]
+        ]
+        before_trades = {
+            key: dict(value)
+            for key, value in b.trades.items()
+        }
+
+        # Different event, but duplicate trade_id.
+        result = b.apply({
+            "event_id": "fill-2",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "BUY-2",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "3",
+                "price": "100.00",
+                "principal": "300.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T-DUP",
+            },
+        })
+
+        self.assertEqual(result, [])
+
+        # Rejection must leave absolutely everything unchanged.
+        self.assertEqual(b.snapshot(), before_snapshot)
+        self.assertEqual(
+            b.orders["BUY-2"],
+            before_order,
+        )
+        self.assertEqual(
+            b.lots[("C1", "ACME")],
+            before_lots,
+        )
+        self.assertEqual(
+            b.trades,
+            before_trades,
+        )
+
+        self.assertIn("fill-2", b.seen)
+        self.assertNotIn("fill-2", b.events)
+
+    def test_duplicate_trade_id_sell_fill_rejection_is_atomic(self):
+        b = Book()
+
+        # Give C1 a position of 10 ACME shares.
+        b.lots[("C1", "ACME")] = [
+            {
+                "event_id": "buy-1",
+                "trade_id": "ORIGINAL-BUY",
+                "quantity": D("10"),
+                "cost": D("1000.00"),
+            },
+        ]
+
+        # Create a valid trade_id using an independent BUY.
+        b.apply({
+            "event_id": "dep-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C2",
+                "amount": "2000.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "buy-order-1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "BUY-C2",
+                "customer_id": "C2",
+                "side": "buy",
+                "symbol": "XYZ",
+                "quantity": "1",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        first_fill = b.apply({
+            "event_id": "buy-fill-1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "BUY-C2",
+                "customer_id": "C2",
+                "side": "buy",
+                "symbol": "XYZ",
+                "quantity": "1",
+                "price": "100.00",
+                "principal": "100.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T-DUP-SELL",
+            },
+        })
+
+        self.assertTrue(first_fill)
+        self.assertIn("T-DUP-SELL", b.trades)
+
+        # C1 now places a legitimate SELL order.
+        b.apply({
+            "event_id": "sell-order-1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "SELL-C1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "6",
+                "limit_price": "120.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        before_snapshot = b.snapshot()
+        before_order = dict(b.orders["SELL-C1"])
+        before_lots = [
+            dict(x) for x in b.lots[("C1", "ACME")]
+        ]
+        before_trades = {
+            key: dict(value)
+            for key, value in b.trades.items()
+        }
+
+        # The fill itself is otherwise valid, but deliberately reuses
+        # an existing trade_id.
+        result = b.apply({
+            "event_id": "sell-fill-bad",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "SELL-C1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "6",
+                "price": "120.00",
+                "principal": "720.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T-DUP-SELL",
+            },
+        })
+
+        self.assertEqual(result, [])
+
+        # Nothing about C1's order or FIFO position may have changed.
+        self.assertEqual(b.snapshot(), before_snapshot)
+        self.assertEqual(
+            b.orders["SELL-C1"],
+            before_order,
+        )
+        self.assertEqual(
+            b.lots[("C1", "ACME")],
+            before_lots,
+        )
+
+        # Existing trade registry must also be untouched.
+        self.assertEqual(
+            b.trades,
+            before_trades,
+        )
+
+        # First delivery of the rejected event is still considered seen.
+        self.assertIn("sell-fill-bad", b.seen)
+        self.assertNotIn("sell-fill-bad", b.events)
+
+    def test_customer_positions_and_sell_holds_are_isolated(self):
+        b = Book()
+
+        # Both customers own the same symbol, but different quantities/costs.
+        b.lots[("C1", "ACME")] = [
+            {
+                "event_id": "c1-buy",
+                "trade_id": "C1-T1",
+                "quantity": D("10"),
+                "cost": D("1000.00"),
+            },
+        ]
+
+        b.lots[("C2", "ACME")] = [
+            {
+                "event_id": "c2-buy",
+                "trade_id": "C2-T1",
+                "quantity": D("20"),
+                "cost": D("3000.00"),
+            },
+        ]
+
+        # C1 reserves 6 of its 10 shares.
+        result = b.apply({
+            "event_id": "c1-sell-order",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "C1-SELL",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "6",
+                "limit_price": "120.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        self.assertEqual(result, [])
+
+        # C1's hold must not affect C2.
+        self.assertEqual(
+            b._owned_quantity("C1", "ACME"),
+            D("10"),
+        )
+        self.assertEqual(
+            b._owned_quantity("C2", "ACME"),
+            D("20"),
+        )
+
+        self.assertEqual(
+            b._share_hold("C1", "ACME"),
+            D("6"),
+        )
+        self.assertEqual(
+            b._share_hold("C2", "ACME"),
+            D("0"),
+        )
+
+        # C1 only has 4 unreserved shares, so another order for 5 rejects.
+        rejected = b.apply({
+            "event_id": "c1-oversell",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "C1-SELL-2",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "5",
+                "limit_price": "120.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        self.assertEqual(rejected, [])
+        self.assertNotIn("C1-SELL-2", b.orders)
+
+        # C2 still independently has all 20 shares available.
+        accepted = b.apply({
+            "event_id": "c2-sell-order",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "C2-SELL",
+                "customer_id": "C2",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "20",
+                "limit_price": "120.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        self.assertEqual(accepted, [])
+        self.assertIn("C2-SELL", b.orders)
+
+        snap = b.snapshot()
+
+        self.assertEqual(
+            snap["customers"]["C1"]["positions"]["ACME"],
+            {
+                "quantity": "10.00",
+                "cost_basis": "1000.00",
+            },
+        )
+
+        self.assertEqual(
+            snap["customers"]["C2"]["positions"]["ACME"],
+            {
+                "quantity": "20.00",
+                "cost_basis": "3000.00",
+            },
+        )
+
+    def test_replay_of_processed_lifecycle_does_not_change_state(self):
+        b = Book()
+
+        events = [
+            {
+                "event_id": "replay-dep",
+                "type": "deposit",
+                "payload": {
+                    "customer_id": "C1",
+                    "amount": "5000.00",
+                },
+            },
+            {
+                "event_id": "replay-order",
+                "type": "order_placed",
+                "payload": {
+                    "order_id": "REPLAY-BUY",
+                    "customer_id": "C1",
+                    "side": "buy",
+                    "symbol": "ACME",
+                    "quantity": "10",
+                    "limit_price": "100.00",
+                    "asset_class": "equity",
+                    "est_charges": "10.00",
+                },
+            },
+            {
+                "event_id": "replay-fill",
+                "type": "order_filled",
+                "payload": {
+                    "order_id": "REPLAY-BUY",
+                    "customer_id": "C1",
+                    "side": "buy",
+                    "symbol": "ACME",
+                    "quantity": "10",
+                    "price": "100.00",
+                    "principal": "1000.00",
+                    "asset_class": "equity",
+                    "broker": "BRK-A",
+                    "partner_rate": "0.50",
+                    "trade_id": "REPLAY-T1",
+                },
+            },
+            {
+                "event_id": "replay-settle",
+                "type": "trade_settled",
+                "payload": {
+                    "trade_id": "REPLAY-T1",
+                },
+            },
+        ]
+
+        # First delivery.
+        for event in events:
+            b.apply(event)
+
+        before_snapshot = b.snapshot()
+        before_orders = {
+            key: dict(value)
+            for key, value in b.orders.items()
+        }
+        before_trades = {
+            key: dict(value)
+            for key, value in b.trades.items()
+        }
+        before_lots = {
+            key: [dict(lot) for lot in lots]
+            for key, lots in b.lots.items()
+        }
+
+        # Simulate the server replaying the same processed range.
+        replay_results = [
+            b.apply(event)
+            for event in events
+        ]
+
+        # Every duplicate should produce no new journal.
+        self.assertEqual(
+            replay_results,
+            [[], [], [], []],
+        )
+
+        # Absolutely no economic/internal state should change.
+        self.assertEqual(
+            b.snapshot(),
+            before_snapshot,
+        )
+        self.assertEqual(
+            b.orders,
+            before_orders,
+        )
+        self.assertEqual(
+            b.trades,
+            before_trades,
+        )
+        self.assertEqual(
+            dict(b.lots),
+            before_lots,
+        )
+
+        # The original accepted audit records remain present.
+        for event in events:
+            self.assertIn(event["event_id"], b.events)
+
 if __name__ == "__main__":
     unittest.main()

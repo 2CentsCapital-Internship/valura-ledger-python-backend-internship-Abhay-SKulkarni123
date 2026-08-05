@@ -676,6 +676,9 @@ class Book:
         if fill_quantity >= order["remaining_quantity"]:
             raise Rejected()
 
+        # Validate the trade before changing holds, orders, or FIFO lots.
+        self._validate_trade(p)
+
         if p["side"] == "buy":
             remaining_before = order["remaining_quantity"]
             hold_before = order["remaining_cash_hold"]
@@ -738,6 +741,9 @@ class Book:
         if fill_quantity != order["remaining_quantity"]:
             raise Rejected()
 
+        # Validate the trade before changing holds, orders, or FIFO lots.
+        self._validate_trade(p)
+
         if p["side"] == "buy":
             order["remaining_quantity"] = ZERO
             order["remaining_cash_hold"] = ZERO
@@ -772,7 +778,7 @@ class Book:
                 fifo_cost,
             )
 
-    def _record_trade(self, p):
+    def _validate_trade(self, p):
         trade_id = p.get("trade_id")
 
         if not trade_id:
@@ -788,6 +794,14 @@ class Book:
         principal = money(D(p["principal"]))
         if principal <= ZERO:
             raise Rejected()
+
+
+    def _record_trade(self, p):
+        self._validate_trade(p)
+
+        trade_id = p["trade_id"]
+        side = p["side"]
+        principal = money(D(p["principal"]))
 
         self.trades[trade_id] = {
             "trade_id": trade_id,
