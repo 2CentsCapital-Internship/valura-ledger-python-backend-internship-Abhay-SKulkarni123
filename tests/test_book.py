@@ -2236,5 +2236,393 @@ class TestPayableSettlements(unittest.TestCase):
             D("0.00"),
         )
 
+class TestCorporateActions(unittest.TestCase):
+
+    def test_cash_dividend_credits_wallet_with_net_amount(self):
+        b = Book()
+
+        legs = b.apply({
+            "event_id": "div1",
+            "type": "dividend_cash",
+            "payload": {
+                "customer_id": "C1",
+                "symbol": "ACME",
+                "gross_amount": "100.00",
+                "withholding_tax": "15.00",
+                "net_amount": "85.00",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "1100",
+                    "customer_id": "C1",
+                    "debit": "85.00",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "2010",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "85.00",
+                },
+            ],
+        )
+
+        snap = b.snapshot()
+
+        self.assertEqual(
+            snap["customers"]["C1"]["wallet_cash"],
+            "85.00",
+        )
+
+        self.assertEqual(
+            snap["trial_balance"]["1100"],
+            "85.00",
+        )
+
+        self.assertEqual(
+            snap["trial_balance"]["2010"],
+            "-85.00",
+        )
+
+
+    def test_invalid_cash_dividend_is_rejected_without_state_change(self):
+        b = Book()
+
+        before = b.snapshot()
+
+        # 100 - 15 != 90
+        legs = b.apply({
+            "event_id": "div-invalid",
+            "type": "dividend_cash",
+            "payload": {
+                "customer_id": "C1",
+                "symbol": "ACME",
+                "gross_amount": "100.00",
+                "withholding_tax": "15.00",
+                "net_amount": "90.00",
+            },
+        })
+
+        self.assertEqual(legs, [])
+        self.assertEqual(b.snapshot(), before)
+
+
+    def test_reinvested_dividend_creates_position_without_cash(self):
+        b = Book()
+
+        legs = b.apply({
+            "event_id": "dr1",
+            "type": "dividend_reinvested",
+            "payload": {
+                "customer_id": "C1",
+                "symbol": "ACME",
+                "gross_amount": "100.00",
+                "withholding_tax": "15.00",
+                "net_amount": "85.00",
+                "reinvest_price": "17.00",
+                "reinvest_quantity": "5",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "1200",
+                    "customer_id": "C1",
+                    "debit": "85.00",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "2100",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "85.00",
+                },
+            ],
+        )
+
+        snap = b.snapshot()
+
+        self.assertEqual(
+            snap["customers"]["C1"]["wallet_cash"],
+            "0.00",
+        )
+
+        self.assertEqual(
+            snap["customers"]["C1"]["positions"]["ACME"],
+            {
+                "quantity": "5.00",
+                "cost_basis": "85.00",
+            },
+        )
+
+
+    def test_reinvested_dividend_appends_fifo_lot(self):
+        b = Book()
+
+        b.lots[("C1", "ACME")] = [
+            {
+                "event_id": "old",
+                "trade_id": "T1",
+                "quantity": D("10"),
+                "cost": D("1000.00"),
+            }
+        ]
+
+        b.apply({
+            "event_id": "dr2",
+            "type": "dividend_reinvested",
+            "payload": {
+                "customer_id": "C1",
+                "symbol": "ACME",
+                "gross_amount": "100.00",
+                "withholding_tax": "15.00",
+                "net_amount": "85.00",
+                "reinvest_price": "17.00",
+                "reinvest_quantity": "5",
+            },
+        })
+
+        lots = b.lots[("C1", "ACME")]
+
+        self.assertEqual(len(lots), 2)
+
+        self.assertEqual(
+            lots[0]["trade_id"],
+            "T1",
+        )
+
+        self.assertEqual(
+            lots[0]["quantity"],
+            D("10"),
+        )
+
+        self.assertEqual(
+            lots[1]["event_id"],
+            "dr2",
+        )
+
+        self.assertEqual(
+            lots[1]["quantity"],
+            D("5"),
+        )
+
+        self.assertEqual(
+            lots[1]["cost"],
+            D("85.00"),
+        )
+
+
+    def test_stock_split_scales_each_lot_and_preserves_cost(self):
+        b = Book()
+
+        b.lots[("C1", "ACME")] = [
+            {
+                "event_id": "x1",
+                "trade_id": "T1",
+                "quantity": D("10"),
+                "cost": D("1000.00"),
+            },
+            {
+                "event_id": "x2",
+                "trade_id": "T2",
+                "quantity": D("5"),
+                "cost": D("600.00"),
+            },
+        ]
+
+        legs = b.apply({
+            "event_id": "split1",
+            "type": "stock_split",
+            "payload": {
+                "customer_id": "C1",
+                "symbol": "ACME",
+                "ratio_from": "1",
+                "ratio_to": "2",
+            },
+        })
+
+        self.assertEqual(legs, [])
+
+        lots = b.lots[("C1", "ACME")]
+
+        self.assertEqual(lots[0]["quantity"], D("20"))
+        self.assertEqual(lots[0]["cost"], D("1000.00"))
+
+        self.assertEqual(lots[1]["quantity"], D("10"))
+        self.assertEqual(lots[1]["cost"], D("600.00"))
+
+        position = (
+            b.snapshot()["customers"]["C1"]["positions"]["ACME"]
+        )
+
+        self.assertEqual(
+            position,
+            {
+                "quantity": "30.00",
+                "cost_basis": "1600.00",
+            },
+        )
+
+
+    def test_stock_split_is_customer_specific(self):
+        b = Book()
+
+        b.lots[("C1", "ACME")] = [{
+            "event_id": "c1",
+            "trade_id": "T1",
+            "quantity": D("10"),
+            "cost": D("1000.00"),
+        }]
+
+        b.lots[("C2", "ACME")] = [{
+            "event_id": "c2",
+            "trade_id": "T2",
+            "quantity": D("7"),
+            "cost": D("700.00"),
+        }]
+
+        b.apply({
+            "event_id": "split-C1",
+            "type": "stock_split",
+            "payload": {
+                "customer_id": "C1",
+                "symbol": "ACME",
+                "ratio_from": "1",
+                "ratio_to": "2",
+            },
+        })
+
+        self.assertEqual(
+            b.lots[("C1", "ACME")][0]["quantity"],
+            D("20"),
+        )
+
+        # C2 must be completely untouched.
+        self.assertEqual(
+            b.lots[("C2", "ACME")][0]["quantity"],
+            D("7"),
+        )
+
+        self.assertEqual(
+            b.lots[("C2", "ACME")][0]["cost"],
+            D("700.00"),
+        )
+
+
+    def test_symbol_change_rekeys_lots_without_changing_position(self):
+        b = Book()
+
+        b.lots[("C1", "OLD")] = [
+            {
+                "event_id": "x1",
+                "trade_id": "T1",
+                "quantity": D("10"),
+                "cost": D("1000.00"),
+            },
+            {
+                "event_id": "x2",
+                "trade_id": "T2",
+                "quantity": D("5"),
+                "cost": D("600.00"),
+            },
+        ]
+
+        legs = b.apply({
+            "event_id": "symbol1",
+            "type": "symbol_change",
+            "payload": {
+                "customer_id": "C1",
+                "old_symbol": "OLD",
+                "new_symbol": "NEW",
+            },
+        })
+
+        self.assertEqual(legs, [])
+
+        self.assertNotIn(
+            ("C1", "OLD"),
+            b.lots,
+        )
+
+        self.assertIn(
+            ("C1", "NEW"),
+            b.lots,
+        )
+
+        snap = b.snapshot()
+
+        self.assertNotIn(
+            "OLD",
+            snap["customers"]["C1"]["positions"],
+        )
+
+        self.assertEqual(
+            snap["customers"]["C1"]["positions"]["NEW"],
+            {
+                "quantity": "15.00",
+                "cost_basis": "1600.00",
+            },
+        )
+
+
+    def test_symbol_change_does_not_affect_other_customer(self):
+        b = Book()
+
+        b.lots[("C1", "OLD")] = [{
+            "event_id": "x1",
+            "trade_id": "T1",
+            "quantity": D("10"),
+            "cost": D("1000.00"),
+        }]
+
+        b.lots[("C2", "OLD")] = [{
+            "event_id": "x2",
+            "trade_id": "T2",
+            "quantity": D("8"),
+            "cost": D("800.00"),
+        }]
+
+        b.apply({
+            "event_id": "symbol-C1",
+            "type": "symbol_change",
+            "payload": {
+                "customer_id": "C1",
+                "old_symbol": "OLD",
+                "new_symbol": "NEW",
+            },
+        })
+
+        self.assertIn(
+            ("C1", "NEW"),
+            b.lots,
+        )
+
+        self.assertNotIn(
+            ("C1", "OLD"),
+            b.lots,
+        )
+
+        # C2 still owns OLD.
+        self.assertIn(
+            ("C2", "OLD"),
+            b.lots,
+        )
+
+        self.assertEqual(
+            b.lots[("C2", "OLD")][0]["quantity"],
+            D("8"),
+        )
+
+        self.assertEqual(
+            b.lots[("C2", "OLD")][0]["cost"],
+            D("800.00"),
+        )
+
 if __name__ == "__main__":
     unittest.main()

@@ -815,20 +815,120 @@ class Book:
         return self.on_order_cancelled(p, ev)
 
     def on_dividend_cash(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 net / Cr 2010 net. Tax is withheld at source, so raise no "
-            "payable")
+        cid = p["customer_id"]
+
+        gross = money(D(p["gross_amount"]))
+        withholding = money(D(p["withholding_tax"]))
+        net = money(D(p["net_amount"]))
+
+        if gross <= ZERO or withholding < ZERO or net <= ZERO:
+            raise Rejected()
+
+        # Tax was withheld at source. Only the net reaches us.
+        if money(gross - withholding) != net:
+            raise Rejected()
+
+        return [
+            leg("1100", cid, debit=net),
+            leg("2010", cid, credit=net),
+        ]
 
     def on_dividend_reinvested(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1200 net / Cr 2100 net, and add a lot. Cash is not involved")
+        cid = p["customer_id"]
+        symbol = p["symbol"]
+
+        gross = money(D(p["gross_amount"]))
+        withholding = money(D(p["withholding_tax"]))
+        net = money(D(p["net_amount"]))
+
+        reinvest_price = D(p["reinvest_price"])
+        reinvest_quantity = D(p["reinvest_quantity"])
+
+        if gross <= ZERO:
+            raise Rejected()
+
+        if withholding < ZERO:
+            raise Rejected()
+
+        if net <= ZERO:
+            raise Rejected()
+
+        if reinvest_price <= ZERO or reinvest_quantity <= ZERO:
+            raise Rejected()
+
+        # Tax is withheld at source.
+        if money(gross - withholding) != net:
+            raise Rejected()
+
+        # The reinvested shares should represent the net dividend amount.
+        if money(reinvest_price * reinvest_quantity) != net:
+            raise Rejected()
+
+        self.lots[(cid, symbol)].append({
+            "event_id": ev["event_id"],
+            "trade_id": None,
+            "quantity": reinvest_quantity,
+            "cost": net,
+        })
+
+        return [
+            leg("1200", cid, debit=net),
+            leg("2100", cid, credit=net),
+        ]
 
     def on_stock_split(self, p, ev):
-        raise NotImplementedError(
-            "No legs. Quantity scales; total cost does not change")
+        cid = p["customer_id"]
+        symbol = p["symbol"]
+
+        ratio_from = D(p["ratio_from"])
+        ratio_to = D(p["ratio_to"])
+
+        if ratio_from <= ZERO or ratio_to <= ZERO:
+            raise Rejected()
+
+        key = (cid, symbol)
+        lots = self.lots.get(key)
+
+        if not lots:
+            raise Rejected()
+
+        factor = ratio_to / ratio_from
+
+        for lot in lots:
+            lot["quantity"] = lot["quantity"] * factor
+
+        # Corporate action only changes share quantities.
+        # Total cost of every FIFO lot remains unchanged.
+        return []
 
     def on_symbol_change(self, p, ev):
-        raise NotImplementedError("No legs. Re-key the holding")
+        cid = p["customer_id"]
+        old_symbol = p["old_symbol"]
+        new_symbol = p["new_symbol"]
+
+        if not old_symbol or not new_symbol:
+            raise Rejected()
+
+        if old_symbol == new_symbol:
+            raise Rejected()
+
+        old_key = (cid, old_symbol)
+        new_key = (cid, new_symbol)
+
+        old_lots = self.lots.get(old_key)
+
+        if not old_lots:
+            raise Rejected()
+
+        # Do not silently merge into an already-existing holding under the
+        # destination symbol.
+        if self.lots.get(new_key):
+            raise Rejected()
+
+        self.lots[new_key] = old_lots
+        del self.lots[old_key]
+
+        return []
 
     def on_reversal(self, p, ev):
         raise NotImplementedError(
