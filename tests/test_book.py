@@ -1861,5 +1861,380 @@ class TestTradeSettlement(unittest.TestCase):
             "0.00",
         )
 
+class TestPayableSettlements(unittest.TestCase):
+
+    def _create_buy_trade(
+        self,
+        b,
+        suffix,
+        customer_id="C1",
+        broker="BRK-A",
+        principal="1000.00",
+    ):
+        b.apply({
+            "event_id": f"o-{suffix}",
+            "type": "order_placed",
+            "payload": {
+                "order_id": f"ORD-{suffix}",
+                "customer_id": customer_id,
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        return b.apply({
+            "event_id": f"f-{suffix}",
+            "type": "order_filled",
+            "payload": {
+                "order_id": f"ORD-{suffix}",
+                "customer_id": customer_id,
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "price": "100.00",
+                "principal": principal,
+                "asset_class": "equity",
+                "broker": broker,
+                "partner_rate": "0.50",
+                "trade_id": f"T-{suffix}",
+            },
+        })
+
+
+    def test_broker_fee_settlement_clears_brk_a_payable(self):
+        b = Book()
+        self._create_buy_trade(b, "A", broker="BRK-A")
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2411"],
+            "-1.25",
+        )
+
+        legs = b.apply({
+            "event_id": "bs-A",
+            "type": "broker_fees_settled",
+            "payload": {
+                "customer_id": "C1",
+                "broker": "BRK-A",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "2411",
+                    "customer_id": "C1",
+                    "debit": "1.25",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "1100",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "1.25",
+                },
+            ],
+        )
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2411"],
+            "0.00",
+        )
+
+
+    def test_broker_routes_to_correct_payable_accounts(self):
+        cases = [
+            ("BRK-A", "2411", "1.25"),
+            ("BRK-B", "2412", "3.80"),
+            ("BRK-C", "2413", "1.40"),
+        ]
+
+        for index, (broker, account, amount) in enumerate(cases):
+            b = Book()
+
+            self._create_buy_trade(
+                b,
+                str(index),
+                broker=broker,
+            )
+
+            self.assertEqual(
+                b.snapshot()["trial_balance"][account],
+                f"-{amount}",
+            )
+
+            legs = b.apply({
+                "event_id": f"bs-{index}",
+                "type": "broker_fees_settled",
+                "payload": {
+                    "customer_id": "C1",
+                    "broker": broker,
+                },
+            })
+
+            self.assertEqual(
+                legs[0]["account"],
+                account,
+            )
+
+            self.assertEqual(
+                legs[0]["debit"],
+                amount,
+            )
+
+            self.assertEqual(
+                b.snapshot()["trial_balance"][account],
+                "0.00",
+            )
+
+
+    def test_custodian_fee_settlement_clears_full_payable(self):
+        b = Book()
+        self._create_buy_trade(b, "CUST")
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2420"],
+            "-0.20",
+        )
+
+        legs = b.apply({
+            "event_id": "cust-settle",
+            "type": "custodian_fees_settled",
+            "payload": {
+                "customer_id": "C1",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "2420",
+                    "customer_id": "C1",
+                    "debit": "0.20",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "1100",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "0.20",
+                },
+            ],
+        )
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2420"],
+            "0.00",
+        )
+
+
+    def test_reg_fee_remittance_clears_full_payable(self):
+        b = Book()
+        self._create_buy_trade(b, "REG")
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2400"],
+            "-0.80",
+        )
+
+        legs = b.apply({
+            "event_id": "reg-settle",
+            "type": "reg_fees_remitted",
+            "payload": {
+                "customer_id": "C1",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "2400",
+                    "customer_id": "C1",
+                    "debit": "0.80",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "1100",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "0.80",
+                },
+            ],
+        )
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2400"],
+            "0.00",
+        )
+
+
+    def test_partner_payout_clears_full_payable(self):
+        b = Book()
+        self._create_buy_trade(b, "PARTNER")
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2430"],
+            "-0.48",
+        )
+
+        legs = b.apply({
+            "event_id": "partner-settle",
+            "type": "partner_payout",
+            "payload": {
+                "customer_id": "C1",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "2430",
+                    "customer_id": "C1",
+                    "debit": "0.48",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "1100",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "0.48",
+                },
+            ],
+        )
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2430"],
+            "0.00",
+        )
+
+
+    def test_second_settlement_with_nothing_outstanding_is_rejected(self):
+        b = Book()
+        self._create_buy_trade(b, "DUP")
+
+        first = b.apply({
+            "event_id": "bs-1",
+            "type": "broker_fees_settled",
+            "payload": {
+                "customer_id": "C1",
+                "broker": "BRK-A",
+            },
+        })
+
+        self.assertTrue(first)
+
+        before = b.snapshot()
+
+        second = b.apply({
+            "event_id": "bs-2",
+            "type": "broker_fees_settled",
+            "payload": {
+                "customer_id": "C1",
+                "broker": "BRK-A",
+            },
+        })
+
+        self.assertEqual(second, [])
+        self.assertEqual(b.snapshot(), before)
+
+
+    def test_settlement_is_per_customer(self):
+        b = Book()
+
+        self._create_buy_trade(
+            b,
+            "C1",
+            customer_id="C1",
+            broker="BRK-A",
+        )
+
+        self._create_buy_trade(
+            b,
+            "C2",
+            customer_id="C2",
+            broker="BRK-A",
+        )
+
+        self.assertEqual(
+            b.balances[("C1", "2411")],
+            D("-1.25"),
+        )
+
+        self.assertEqual(
+            b.balances[("C2", "2411")],
+            D("-1.25"),
+        )
+
+        b.apply({
+            "event_id": "settle-C1",
+            "type": "broker_fees_settled",
+            "payload": {
+                "customer_id": "C1",
+                "broker": "BRK-A",
+            },
+        })
+
+        self.assertEqual(
+            b.balances[("C1", "2411")],
+            D("0.00"),
+        )
+
+        self.assertEqual(
+            b.balances[("C2", "2411")],
+            D("-1.25"),
+        )
+
+
+    def test_multiple_trades_accumulate_before_single_settlement(self):
+        b = Book()
+
+        self._create_buy_trade(b, "M1", broker="BRK-A")
+        self._create_buy_trade(b, "M2", broker="BRK-A")
+
+        self.assertEqual(
+            b.balances[("C1", "2411")],
+            D("-2.50"),
+        )
+
+        legs = b.apply({
+            "event_id": "settle-all",
+            "type": "broker_fees_settled",
+            "payload": {
+                "customer_id": "C1",
+                "broker": "BRK-A",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "2411",
+                    "customer_id": "C1",
+                    "debit": "2.50",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "1100",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "2.50",
+                },
+            ],
+        )
+
+        self.assertEqual(
+            b.balances[("C1", "2411")],
+            D("0.00"),
+        )
+
 if __name__ == "__main__":
     unittest.main()

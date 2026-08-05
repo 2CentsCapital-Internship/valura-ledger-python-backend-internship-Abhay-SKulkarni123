@@ -728,6 +728,73 @@ class Book:
 
         return legs
 
+    def on_broker_fees_settled(self, p, ev):
+        cid = p["customer_id"]
+        broker = p["broker"]
+
+        tariff = TARIFFS.get(broker)
+        if tariff is None:
+            raise Rejected()
+
+        payable_account = tariff["payable_account"]
+
+        # Pay the full accumulated liability for this customer/broker.
+        balance = self.balances.get((cid, payable_account), ZERO)
+        amount = money(-balance)
+
+        if amount <= ZERO:
+            raise Rejected()
+
+        return [
+            leg(payable_account, cid, debit=amount),
+            leg("1100", cid, credit=amount),
+        ]
+
+
+    def on_custodian_fees_settled(self, p, ev):
+        cid = p["customer_id"]
+
+        balance = self.balances.get((cid, "2420"), ZERO)
+        amount = money(-balance)
+
+        if amount <= ZERO:
+            raise Rejected()
+
+        return [
+            leg("2420", cid, debit=amount),
+            leg("1100", cid, credit=amount),
+        ]
+
+
+    def on_reg_fees_remitted(self, p, ev):
+        cid = p["customer_id"]
+
+        balance = self.balances.get((cid, "2400"), ZERO)
+        amount = money(-balance)
+
+        if amount <= ZERO:
+            raise Rejected()
+
+        return [
+            leg("2400", cid, debit=amount),
+            leg("1100", cid, credit=amount),
+        ]
+
+
+    def on_partner_payout(self, p, ev):
+        cid = p["customer_id"]
+
+        balance = self.balances.get((cid, "2430"), ZERO)
+        amount = money(-balance)
+
+        if amount <= ZERO:
+            raise Rejected()
+
+        return [
+            leg("2430", cid, debit=amount),
+            leg("1100", cid, credit=amount),
+        ]
+
     def on_order_cancelled(self, p, ev):
         order_id = p["order_id"]
 
