@@ -1485,5 +1485,381 @@ class TestTradeAccounting(unittest.TestCase):
             D("0.00"),
         )
 
+class TestTradeSettlement(unittest.TestCase):
+
+    def _filled_buy(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "d1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "2000.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "o1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "ORD1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "f1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "ORD1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "price": "100.00",
+                "principal": "1000.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T1",
+            },
+        })
+
+        return b
+
+
+    def test_buy_trade_settlement_clears_broker_payable(self):
+        b = self._filled_buy()
+
+        legs = b.apply({
+            "event_id": "st1",
+            "type": "trade_settled",
+            "payload": {
+                "trade_id": "T1",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "2350",
+                    "customer_id": "C1",
+                    "debit": "1000.00",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "1100",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "1000.00",
+                },
+            ],
+        )
+
+        self.assertTrue(
+            b.trades["T1"]["settled"]
+        )
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2350"],
+            "0.00",
+        )
+
+
+    def test_duplicate_trade_settlement_is_rejected(self):
+        b = self._filled_buy()
+
+        first = b.apply({
+            "event_id": "st1",
+            "type": "trade_settled",
+            "payload": {
+                "trade_id": "T1",
+            },
+        })
+
+        self.assertTrue(first)
+
+        snapshot_before = b.snapshot()
+
+        second = b.apply({
+            "event_id": "st2",
+            "type": "trade_settled",
+            "payload": {
+                "trade_id": "T1",
+            },
+        })
+
+        self.assertEqual(second, [])
+        self.assertEqual(
+            b.snapshot(),
+            snapshot_before,
+        )
+
+
+    def test_unknown_trade_settlement_is_rejected(self):
+        b = Book()
+
+        before = b.snapshot()
+
+        legs = b.apply({
+            "event_id": "st1",
+            "type": "trade_settled",
+            "payload": {
+                "trade_id": "DOES-NOT-EXIST",
+            },
+        })
+
+        self.assertEqual(legs, [])
+        self.assertEqual(
+            b.snapshot(),
+            before,
+        )
+
+    def test_sell_trade_settlement_clears_broker_receivable(self):
+        b = Book()
+
+        # Create inventory through a completed BUY.
+        b.apply({
+            "event_id": "bo1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "BUY1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "bf1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "BUY1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "price": "100.00",
+                "principal": "1000.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "BUY-T1",
+            },
+        })
+
+        # Place and fill the SELL.
+        b.apply({
+            "event_id": "so1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "SELL1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "5",
+                "limit_price": "120.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "sf1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "SELL1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "5",
+                "price": "120.00",
+                "principal": "600.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "SELL-T1",
+            },
+        })
+
+        self.assertEqual(
+            b.trades["SELL-T1"]["side"],
+            "sell",
+        )
+
+        self.assertEqual(
+            b.trades["SELL-T1"]["principal"],
+            D("600.00"),
+        )
+
+        legs = b.apply({
+            "event_id": "ss1",
+            "type": "trade_settled",
+            "payload": {
+                "trade_id": "SELL-T1",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "1100",
+                    "customer_id": "C1",
+                    "debit": "600.00",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "1150",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "600.00",
+                },
+            ],
+        )
+
+        self.assertTrue(
+            b.trades["SELL-T1"]["settled"]
+        )
+
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["1150"],
+            "0.00",
+        )
+
+    def test_partial_fill_trades_settle_independently(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "o1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "ORD1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        # First trade: 4 shares / $400.
+        b.apply({
+            "event_id": "pf1",
+            "type": "order_partially_filled",
+            "payload": {
+                "order_id": "ORD1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "4",
+                "price": "100.00",
+                "principal": "400.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T1",
+            },
+        })
+
+        # Second trade: remaining 6 shares / $600.
+        b.apply({
+            "event_id": "f2",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "ORD1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "6",
+                "price": "100.00",
+                "principal": "600.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T2",
+            },
+        })
+
+        self.assertEqual(
+            b.trades["T1"]["principal"],
+            D("400.00"),
+        )
+
+        self.assertEqual(
+            b.trades["T2"]["principal"],
+            D("600.00"),
+        )
+
+        self.assertFalse(b.trades["T1"]["settled"])
+        self.assertFalse(b.trades["T2"]["settled"])
+
+        # Settle only T1.
+        legs = b.apply({
+            "event_id": "st1",
+            "type": "trade_settled",
+            "payload": {
+                "trade_id": "T1",
+            },
+        })
+
+        self.assertEqual(
+            legs,
+            [
+                {
+                    "account": "2350",
+                    "customer_id": "C1",
+                    "debit": "400.00",
+                    "credit": "0.00",
+                },
+                {
+                    "account": "1100",
+                    "customer_id": "C1",
+                    "debit": "0.00",
+                    "credit": "400.00",
+                },
+            ],
+        )
+
+        self.assertTrue(b.trades["T1"]["settled"])
+        self.assertFalse(b.trades["T2"]["settled"])
+
+        # $600 of the original $1000 payable must remain.
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2350"],
+            "-600.00",
+        )
+
+        # Now settle T2.
+        b.apply({
+            "event_id": "st2",
+            "type": "trade_settled",
+            "payload": {
+                "trade_id": "T2",
+            },
+        })
+
+        self.assertTrue(b.trades["T2"]["settled"])
+
+        # Both trades are now settled.
+        self.assertEqual(
+            b.snapshot()["trial_balance"]["2350"],
+            "0.00",
+        )
+
 if __name__ == "__main__":
     unittest.main()

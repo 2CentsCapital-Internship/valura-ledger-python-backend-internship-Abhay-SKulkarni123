@@ -83,6 +83,7 @@ class Book:
         self.withdrawals: dict[str, dict] = {}
         self.orders: dict[str, dict] = {}
         self.lots: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        self.trades: dict[str, dict] = {}
 
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -599,6 +600,7 @@ class Book:
             )
 
             self._add_buy_lot(p, ev)
+            self._record_trade(p)
             return self._buy_fill_legs(p)
 
         if p["side"] == "sell":
@@ -609,7 +611,7 @@ class Book:
             )
 
             order["remaining_quantity"] -= fill_quantity
-
+            self._record_trade(p)
             return self._sell_fill_legs(
                 p,
                 fifo_cost,
@@ -644,7 +646,7 @@ class Book:
             order["status"] = "filled"
 
             self._add_buy_lot(p, ev)
-
+            self._record_trade(p)
             return self._buy_fill_legs(p)
 
         if p["side"] == "sell":
@@ -656,7 +658,7 @@ class Book:
 
             order["remaining_quantity"] = ZERO
             order["status"] = "filled"
-
+            self._record_trade(p)
             return self._sell_fill_legs(
                 p,
                 fifo_cost,
@@ -664,9 +666,67 @@ class Book:
 
         raise Rejected()
 
+    def _record_trade(self, p):
+        trade_id = p.get("trade_id")
+
+        if not trade_id:
+            raise Rejected()
+
+        if trade_id in self.trades:
+            raise Rejected()
+
+        side = p["side"]
+        if side not in ("buy", "sell"):
+            raise Rejected()
+
+        principal = money(D(p["principal"]))
+        if principal <= ZERO:
+            raise Rejected()
+
+        self.trades[trade_id] = {
+            "trade_id": trade_id,
+            "customer_id": p["customer_id"],
+            "side": side,
+            "principal": principal,
+            "settled": False,
+        }
+
     def on_trade_settled(self, p, ev):
-        raise NotImplementedError(
-            "buy: Dr 2350 / Cr 1100.  sell: Dr 1100 / Cr 1150")
+        trade_id = p.get("trade_id")
+
+        if not trade_id:
+            raise Rejected()
+
+        trade = self.trades.get(trade_id)
+
+        if trade is None:
+            raise Rejected()
+
+        if trade["settled"]:
+            raise Rejected()
+
+        cid = trade["customer_id"]
+        principal = trade["principal"]
+        side = trade["side"]
+
+        if side == "buy":
+            legs = [
+                leg("2350", cid, debit=principal),
+                leg("1100", cid, credit=principal),
+            ]
+
+        elif side == "sell":
+            legs = [
+                leg("1100", cid, debit=principal),
+                leg("1150", cid, credit=principal),
+            ]
+
+        else:
+            raise Rejected()
+
+        trade["settled"] = True
+
+        return legs
 
     def on_order_cancelled(self, p, ev):
         order_id = p["order_id"]
