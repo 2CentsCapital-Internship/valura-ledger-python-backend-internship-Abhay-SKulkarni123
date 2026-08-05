@@ -1196,5 +1196,294 @@ class TestSellOrderLifecycle(unittest.TestCase):
             D("1000.00"),
         )
 
+class TestTradeAccounting(unittest.TestCase):
+
+    def test_trade_fee_calculation_exact_amounts(self):
+        b = Book()
+
+        fees = b._trade_fees(
+            "1000.00",
+            "BRK-A",
+            "0.50",
+        )
+
+        self.assertEqual(
+            fees["brokerage"],
+            D("2.00"),
+        )
+        self.assertEqual(
+            fees["custody"],
+            D("0.40"),
+        )
+        self.assertEqual(
+            fees["regulatory"],
+            D("0.80"),
+        )
+        self.assertEqual(
+            fees["broker_cost"],
+            D("1.25"),
+        )
+        self.assertEqual(
+            fees["custody_cost"],
+            D("0.20"),
+        )
+        self.assertEqual(
+            fees["partner_share"],
+            D("0.48"),
+        )
+        self.assertEqual(
+            fees["broker_payable_account"],
+            "2411",
+        )
+
+
+    def test_buy_fill_has_exact_balanced_journal(self):
+        b = Book()
+
+        payload = {
+            "customer_id": "C1",
+            "principal": "1000.00",
+            "broker": "BRK-A",
+            "partner_rate": "0.50",
+        }
+
+        legs = b._buy_fill_legs(payload)
+
+        expected = [
+            {
+                "account": "2010",
+                "customer_id": "C1",
+                "debit": "1003.20",
+                "credit": "0.00",
+            },
+            {
+                "account": "2350",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "1000.00",
+            },
+            {
+                "account": "1200",
+                "customer_id": "C1",
+                "debit": "1000.00",
+                "credit": "0.00",
+            },
+            {
+                "account": "2100",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "1000.00",
+            },
+            {
+                "account": "5000",
+                "customer_id": "C1",
+                "debit": "1.25",
+                "credit": "0.00",
+            },
+            {
+                "account": "4000",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "2.00",
+            },
+            {
+                "account": "5010",
+                "customer_id": "C1",
+                "debit": "0.20",
+                "credit": "0.00",
+            },
+            {
+                "account": "4010",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "0.40",
+            },
+            {
+                "account": "5100",
+                "customer_id": "C1",
+                "debit": "0.48",
+                "credit": "0.00",
+            },
+            {
+                "account": "2400",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "0.80",
+            },
+            {
+                "account": "2411",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "1.25",
+            },
+            {
+                "account": "2420",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "0.20",
+            },
+            {
+                "account": "2430",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "0.48",
+            },
+        ]
+
+        self.assertEqual(legs, expected)
+
+        total_debits = sum(
+            D(item["debit"])
+            for item in legs
+        )
+
+        total_credits = sum(
+            D(item["credit"])
+            for item in legs
+        )
+
+        self.assertEqual(
+            total_debits,
+            total_credits,
+        )
+
+
+    def test_sell_fill_has_exact_balanced_journal(self):
+        b = Book()
+
+        payload = {
+            "customer_id": "C1",
+            "principal": "1000.00",
+            "broker": "BRK-A",
+            "partner_rate": "0.50",
+        }
+
+        legs = b._sell_fill_legs(
+            payload,
+            D("700.00"),
+        )
+
+        expected = [
+            {
+                "account": "1150",
+                "customer_id": "C1",
+                "debit": "1000.00",
+                "credit": "0.00",
+            },
+            {
+                "account": "2010",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "996.80",
+            },
+            {
+                "account": "2100",
+                "customer_id": "C1",
+                "debit": "700.00",
+                "credit": "0.00",
+            },
+            {
+                "account": "1200",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "700.00",
+            },
+            {
+                "account": "5000",
+                "customer_id": "C1",
+                "debit": "1.25",
+                "credit": "0.00",
+            },
+            {
+                "account": "4000",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "2.00",
+            },
+            {
+                "account": "5010",
+                "customer_id": "C1",
+                "debit": "0.20",
+                "credit": "0.00",
+            },
+            {
+                "account": "4010",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "0.40",
+            },
+            {
+                "account": "5100",
+                "customer_id": "C1",
+                "debit": "0.48",
+                "credit": "0.00",
+            },
+            {
+                "account": "2400",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "0.80",
+            },
+            {
+                "account": "2411",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "1.25",
+            },
+            {
+                "account": "2420",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "0.20",
+            },
+            {
+                "account": "2430",
+                "customer_id": "C1",
+                "debit": "0.00",
+                "credit": "0.48",
+            },
+        ]
+
+        self.assertEqual(legs, expected)
+
+        total_debits = sum(
+            D(item["debit"])
+            for item in legs
+        )
+
+        total_credits = sum(
+            D(item["credit"])
+            for item in legs
+        )
+
+        self.assertEqual(
+            total_debits,
+            total_credits,
+        )
+
+    def test_partner_share_is_zero_when_trade_margin_is_negative(self):
+        b = Book()
+
+        fees = b._trade_fees(
+            "10.00",
+            "BRK-B",
+            "0.50",
+        )
+
+        self.assertEqual(
+            fees["brokerage"],
+            D("2.50"),
+        )
+
+        self.assertEqual(
+            fees["broker_cost"],
+            D("3.01"),
+        )
+
+        self.assertEqual(
+            fees["partner_share"],
+            D("0.00"),
+        )
+
 if __name__ == "__main__":
     unittest.main()
