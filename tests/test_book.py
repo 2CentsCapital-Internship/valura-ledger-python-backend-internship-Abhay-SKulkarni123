@@ -764,5 +764,437 @@ class TestSellOrderLifecycle(unittest.TestCase):
             D("10"),
         )
 
+    def test_fifo_consumes_oldest_lots_first(self):
+        b = Book()
+
+        b.lots[("C1", "ACME")].append({
+            "event_id": "buy-1",
+            "trade_id": "T1",
+            "quantity": D("4"),
+            "cost": D("400.00"),
+        })
+
+        b.lots[("C1", "ACME")].append({
+            "event_id": "buy-2",
+            "trade_id": "T2",
+            "quantity": D("6"),
+            "cost": D("600.00"),
+        })
+
+        cost = b._consume_fifo(
+            "C1",
+            "ACME",
+            D("7"),
+        )
+
+        self.assertEqual(cost, D("700.00"))
+
+        lots = b.lots[("C1", "ACME")]
+
+        self.assertEqual(len(lots), 1)
+
+        self.assertEqual(
+            lots[0]["trade_id"],
+            "T2",
+        )
+
+        self.assertEqual(
+            lots[0]["quantity"],
+            D("3"),
+        )
+
+        self.assertEqual(
+            lots[0]["cost"],
+            D("300.00"),
+        )
+
+        position = (
+            b.snapshot()["customers"]["C1"]
+            ["positions"]["ACME"]
+        )
+
+        self.assertEqual(
+            D(position["quantity"]),
+            D("3"),
+        )
+
+        self.assertEqual(
+            D(position["cost_basis"]),
+            D("300.00"),
+        )
+
+    def test_fifo_partial_lot_uses_total_cost_rounding(self):
+        b = Book()
+
+        b.lots[("C1", "ACME")].append({
+            "event_id": "buy-1",
+            "trade_id": "T1",
+            "quantity": D("10"),
+            "cost": D("100.03"),
+        })
+
+        cost = b._consume_fifo(
+            "C1",
+            "ACME",
+            D("3"),
+        )
+
+        self.assertEqual(
+            cost,
+            D("30.01"),
+        )
+
+        lot = b.lots[("C1", "ACME")][0]
+
+        self.assertEqual(
+            lot["quantity"],
+            D("7"),
+        )
+
+        self.assertEqual(
+            lot["cost"],
+            D("70.02"),
+        )
+
+    def test_full_sell_consumes_fifo_and_closes_order(self):
+        b = self._book_with_position()
+
+        self._place_sell(
+            b,
+            event_id="s1",
+            order_id="SELL1",
+            quantity="7",
+        )
+
+        legs = b.apply({
+            "event_id": "sf1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "SELL1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "7",
+                "price": "120.00",
+                "principal": "840.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T-SELL-1",
+            },
+        })
+
+        self.assertTrue(legs)
+
+        order = b.orders["SELL1"]
+
+        self.assertEqual(
+            order["remaining_quantity"],
+            D("0"),
+        )
+        self.assertEqual(order["status"], "filled")
+
+        self.assertEqual(
+            b._share_hold("C1", "ACME"),
+            D("0"),
+        )
+
+        position = (
+            b.snapshot()["customers"]["C1"]
+            ["positions"]["ACME"]
+        )
+
+        self.assertEqual(
+            D(position["quantity"]),
+            D("3"),
+        )
+
+        self.assertEqual(
+            D(position["cost_basis"]),
+            D("300.00"),
+        )
+
+    def test_partial_then_final_sell_updates_hold_and_position(self):
+        b = self._book_with_position()
+
+        self._place_sell(
+            b,
+            event_id="s1",
+            order_id="SELL1",
+            quantity="7",
+        )
+
+        b.apply({
+            "event_id": "sp1",
+            "type": "order_partially_filled",
+            "payload": {
+                "order_id": "SELL1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "4",
+                "price": "120.00",
+                "principal": "480.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T-SELL-1",
+            },
+        })
+
+        self.assertEqual(
+            b.orders["SELL1"]["remaining_quantity"],
+            D("3"),
+        )
+
+        self.assertEqual(
+            b.orders["SELL1"]["status"],
+            "open",
+        )
+
+        self.assertEqual(
+            b._share_hold("C1", "ACME"),
+            D("3"),
+        )
+
+        position = (
+            b.snapshot()["customers"]["C1"]
+            ["positions"]["ACME"]
+        )
+
+        self.assertEqual(
+            D(position["quantity"]),
+            D("6"),
+        )
+
+        self.assertEqual(
+            D(position["cost_basis"]),
+            D("600.00"),
+        )
+
+        b.apply({
+            "event_id": "sf1",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "SELL1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "3",
+                "price": "125.00",
+                "principal": "375.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T-SELL-2",
+            },
+        })
+
+        self.assertEqual(
+            b.orders["SELL1"]["remaining_quantity"],
+            D("0"),
+        )
+
+        self.assertEqual(
+            b.orders["SELL1"]["status"],
+            "filled",
+        )
+
+        self.assertEqual(
+            b._share_hold("C1", "ACME"),
+            D("0"),
+        )
+
+        position = (
+            b.snapshot()["customers"]["C1"]
+            ["positions"]["ACME"]
+        )
+
+        self.assertEqual(
+            D(position["quantity"]),
+            D("3"),
+        )
+
+        self.assertEqual(
+            D(position["cost_basis"]),
+            D("300.00"),
+        )
+
+    def test_sell_across_multiple_lots_uses_fifo_cost(self):
+        b = Book()
+
+        # Oldest lot: 4 shares costing 400 total.
+        b.lots[("C1", "ACME")].append({
+            "event_id": "buy-1",
+            "trade_id": "T-BUY-1",
+            "quantity": D("4"),
+            "cost": D("400.00"),
+        })
+
+        # Newer lot: 6 shares costing 720 total.
+        b.lots[("C1", "ACME")].append({
+            "event_id": "buy-2",
+            "trade_id": "T-BUY-2",
+            "quantity": D("6"),
+            "cost": D("720.00"),
+        })
+
+        # Sell 7 of the 10 shares.
+        b.apply({
+            "event_id": "sell-order",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "SELL1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "7",
+                "limit_price": "150.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        legs = b.apply({
+            "event_id": "sell-fill",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "SELL1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "7",
+                "price": "150.00",
+                "principal": "1050.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T-SELL-1",
+            },
+        })
+
+        self.assertTrue(legs)
+
+        # FIFO:
+        # first 4 shares consume all $400 of lot 1
+        # next 3 consume 3/6 of $720 = $360
+        # total FIFO cost relieved = $760
+        #
+        # Remaining lot:
+        # 3 shares / $360
+        lots = b.lots[("C1", "ACME")]
+
+        self.assertEqual(len(lots), 1)
+        self.assertEqual(
+            lots[0]["trade_id"],
+            "T-BUY-2",
+        )
+        self.assertEqual(
+            lots[0]["quantity"],
+            D("3"),
+        )
+        self.assertEqual(
+            lots[0]["cost"],
+            D("360.00"),
+        )
+
+        position = (
+            b.snapshot()["customers"]["C1"]
+            ["positions"]["ACME"]
+        )
+
+        self.assertEqual(
+            D(position["quantity"]),
+            D("3"),
+        )
+        self.assertEqual(
+            D(position["cost_basis"]),
+            D("360.00"),
+        )
+
+        self.assertEqual(
+            b.orders["SELL1"]["status"],
+            "filled",
+        )
+
+    def test_rejected_sell_fill_does_not_mutate_lots_or_order(self):
+        b = self._book_with_position()
+
+        self._place_sell(
+            b,
+            event_id="s1",
+            order_id="SELL1",
+            quantity="7",
+        )
+
+        lots_before = [
+            {
+                "event_id": lot["event_id"],
+                "trade_id": lot["trade_id"],
+                "quantity": lot["quantity"],
+                "cost": lot["cost"],
+            }
+            for lot in b.lots[("C1", "ACME")]
+        ]
+
+        # Final fill must equal the remaining order quantity.
+        # SELL1 has 7 remaining, so a final fill of 8 is invalid.
+        legs = b.apply({
+            "event_id": "bad-fill",
+            "type": "order_filled",
+            "payload": {
+                "order_id": "SELL1",
+                "customer_id": "C1",
+                "side": "sell",
+                "symbol": "ACME",
+                "quantity": "8",
+                "price": "120.00",
+                "principal": "960.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "T-BAD",
+            },
+        })
+
+        self.assertEqual(legs, [])
+
+        # FIFO lots must be untouched.
+        self.assertEqual(
+            b.lots[("C1", "ACME")],
+            lots_before,
+        )
+
+        # Original SELL order must still be open and unchanged.
+        order = b.orders["SELL1"]
+
+        self.assertEqual(
+            order["remaining_quantity"],
+            D("7"),
+        )
+        self.assertEqual(
+            order["status"],
+            "open",
+        )
+
+        self.assertEqual(
+            b._share_hold("C1", "ACME"),
+            D("7"),
+        )
+
+        position = (
+            b.snapshot()["customers"]["C1"]
+            ["positions"]["ACME"]
+        )
+
+        self.assertEqual(
+            D(position["quantity"]),
+            D("10"),
+        )
+        self.assertEqual(
+            D(position["cost_basis"]),
+            D("1000.00"),
+        )
+
 if __name__ == "__main__":
     unittest.main()

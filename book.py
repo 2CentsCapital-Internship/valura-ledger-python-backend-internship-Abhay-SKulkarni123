@@ -398,6 +398,59 @@ class Book:
 
         return []
 
+    def _consume_fifo(self, customer_id, symbol, quantity):
+        quantity = D(quantity)
+
+        if quantity <= ZERO:
+            raise Rejected()
+
+        lots = self.lots.get((customer_id, symbol), [])
+
+        total_available = sum(
+            (lot["quantity"] for lot in lots),
+            ZERO,
+        )
+
+        if quantity > total_available:
+            raise Rejected()
+
+        remaining_to_sell = quantity
+        cost_relieved = ZERO
+
+        while remaining_to_sell > ZERO:
+            lot = lots[0]
+
+            lot_quantity = lot["quantity"]
+            lot_cost = lot["cost"]
+
+            consumed_quantity = min(
+                remaining_to_sell,
+                lot_quantity,
+            )
+
+            if consumed_quantity == lot_quantity:
+                consumed_cost = lot_cost
+            else:
+                consumed_cost = money(
+                    lot_cost
+                    * consumed_quantity
+                    / lot_quantity
+                )
+
+            cost_relieved += consumed_cost
+
+            lot["quantity"] -= consumed_quantity
+            lot["cost"] = money(
+                lot_cost - consumed_cost
+            )
+
+            remaining_to_sell -= consumed_quantity
+
+            if lot["quantity"] == ZERO:
+                lots.pop(0)
+
+        return money(cost_relieved)
+
     def _add_buy_lot(self, p, ev):
         cid = p["customer_id"]
         symbol = p["symbol"]
@@ -460,13 +513,68 @@ class Book:
             leg("2430", cid, credit=partner_share),
         ]
 
-    def on_order_partially_filled(self, p, ev):
-        if p["side"] != "buy":
-            raise NotImplementedError("SELL fills require FIFO lots")
+    def _sell_fill_legs(self, p, fifo_cost):
+        cid = p["customer_id"]
+        principal = money(D(p["principal"]))
+        fifo_cost = money(fifo_cost)
 
+        fees = self._trade_fees(
+            principal,
+            p["broker"],
+            p["partner_rate"],
+        )
+
+        brokerage = fees["brokerage"]
+        custody = fees["custody"]
+        regulatory = fees["regulatory"]
+        broker_cost = fees["broker_cost"]
+        custody_cost = fees["custody_cost"]
+        partner_share = fees["partner_share"]
+
+        customer_net = money(
+            principal - brokerage - custody - regulatory
+        )
+
+        return [
+            # Sale proceeds become broker receivable.
+            leg("1150", cid, debit=principal),
+
+            # Customer receives net sale proceeds.
+            leg("2010", cid, credit=customer_net),
+
+            # Remove securities at FIFO cost.
+            leg("2100", cid, debit=fifo_cost),
+            leg("1200", cid, credit=fifo_cost),
+
+            # Revenue / costs / payables.
+            leg("5000", cid, debit=broker_cost),
+            leg("4000", cid, credit=brokerage),
+
+            leg("5010", cid, debit=custody_cost),
+            leg("4010", cid, credit=custody),
+
+            leg("5100", cid, debit=partner_share),
+            leg("2400", cid, credit=regulatory),
+
+            leg(
+                fees["broker_payable_account"],
+                cid,
+                credit=broker_cost,
+            ),
+            leg("2420", cid, credit=custody_cost),
+            leg("2430", cid, credit=partner_share),
+        ]
+
+    def on_order_partially_filled(self, p, ev):
         order = self.orders.get(p["order_id"])
 
         if order is None:
+            raise Rejected()
+
+        if order["status"] != "open":
+            raise Rejected()
+
+        if p["side"] != order["side"]:
             raise Rejected()
 
         fill_quantity = D(p["quantity"])
@@ -477,31 +585,49 @@ class Book:
         if fill_quantity >= order["remaining_quantity"]:
             raise Rejected()
 
-        remaining_before = order["remaining_quantity"]
-        hold_before = order["remaining_cash_hold"]
+        if p["side"] == "buy":
+            remaining_before = order["remaining_quantity"]
+            hold_before = order["remaining_cash_hold"]
 
-        # Release the same proportion of the CURRENT remaining hold
-        # as the proportion of remaining quantity filled.
-        release = money(
-            hold_before * fill_quantity / remaining_before
-        )
+            release = money(
+                hold_before * fill_quantity / remaining_before
+            )
 
-        order["remaining_quantity"] -= fill_quantity
-        order["remaining_cash_hold"] = money(
-            hold_before - release
-        )
+            order["remaining_quantity"] -= fill_quantity
+            order["remaining_cash_hold"] = money(
+                hold_before - release
+            )
 
-        self._add_buy_lot(p, ev)
-        return self._buy_fill_legs(p)
+            self._add_buy_lot(p, ev)
+            return self._buy_fill_legs(p)
+
+        if p["side"] == "sell":
+            fifo_cost = self._consume_fifo(
+                p["customer_id"],
+                p["symbol"],
+                fill_quantity,
+            )
+
+            order["remaining_quantity"] -= fill_quantity
+
+            return self._sell_fill_legs(
+                p,
+                fifo_cost,
+            )
+
+        raise Rejected()
 
 
     def on_order_filled(self, p, ev):
-        if p["side"] != "buy":
-            raise NotImplementedError("SELL fills require FIFO lots")
-
         order = self.orders.get(p["order_id"])
 
         if order is None:
+            raise Rejected()
+
+        if order["status"] != "open":
+            raise Rejected()
+
+        if p["side"] != order["side"]:
             raise Rejected()
 
         fill_quantity = D(p["quantity"])
@@ -512,12 +638,31 @@ class Book:
         if fill_quantity != order["remaining_quantity"]:
             raise Rejected()
 
-        order["remaining_quantity"] = ZERO
-        order["remaining_cash_hold"] = ZERO
-        order["status"] = "filled"
+        if p["side"] == "buy":
+            order["remaining_quantity"] = ZERO
+            order["remaining_cash_hold"] = ZERO
+            order["status"] = "filled"
 
-        self._add_buy_lot(p, ev)
-        return self._buy_fill_legs(p)
+            self._add_buy_lot(p, ev)
+
+            return self._buy_fill_legs(p)
+
+        if p["side"] == "sell":
+            fifo_cost = self._consume_fifo(
+                p["customer_id"],
+                p["symbol"],
+                fill_quantity,
+            )
+
+            order["remaining_quantity"] = ZERO
+            order["status"] = "filled"
+
+            return self._sell_fill_legs(
+                p,
+                fifo_cost,
+            )
+
+        raise Rejected()
 
     def on_trade_settled(self, p, ev):
         raise NotImplementedError(
