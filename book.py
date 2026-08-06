@@ -20,11 +20,19 @@ Two things to get right before anything else:
 from __future__ import annotations
 
 from collections import defaultdict
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 D = Decimal
 ZERO = D("0.00")
 BPS = D("0.0001")
+
+class Rejected(Exception):
+    """Raise from a handler for an event you refuse to post.
+
+    An oversell, a reversal of something you never received, a payload that
+    will not parse. Rejecting one event and carrying on beats stopping: a
+    server that stalls misses everything after it.
+    """
 
 TARIFFS = {
     "BRK-A": {
@@ -58,6 +66,18 @@ TARIFFS = {
         "payable_account": "2413",
     },
 }
+
+def decimal_value(value) -> Decimal:
+    """Parse a finite Decimal or reject the event as malformed."""
+    try:
+        result = D(value)
+    except (InvalidOperation, ValueError, TypeError):
+        raise Rejected()
+
+    if not result.is_finite():
+        raise Rejected()
+
+    return result
 
 
 def money(x: Decimal) -> Decimal:
@@ -139,14 +159,14 @@ class Book:
 
             Dr 1100 amount        Cr 2010 amount
         """
-        amount = money(D(p["amount"]))
+        amount = money(decimal_value(p["amount"]))
         cid = p["customer_id"]
         return [leg("1100", cid, debit=amount),
                 leg("2010", cid, credit=amount)]
 
     # -- yours --------------------------------------------------------------
     def on_fee_charged(self, p, ev):
-        amount = money(D(p["amount"]))
+        amount = money(decimal_value(p["amount"]))
         cid = p["customer_id"]
 
         return [
@@ -171,7 +191,7 @@ class Book:
         if source_payload["customer_id"] != cid:
             raise Rejected()
 
-        amount = money(D(source_payload["amount"]))
+        amount = money(decimal_value(source_payload["amount"]))
 
         self.refunded_fees.add(source_id)
 
@@ -183,8 +203,8 @@ class Book:
     def on_interest_credited(self, p, ev):
         cid = p["customer_id"]
 
-        gross = money(D(p["gross_amount"]))
-        customer_share = money(D(p["customer_share"]))
+        gross = money(decimal_value(p["gross_amount"]))
+        customer_share = money(decimal_value(p["customer_share"]))
         firm_share = money(gross - customer_share)
 
         return [
@@ -196,7 +216,7 @@ class Book:
     def on_transfer_between_customers(self, p, ev):
         from_cid = p["from_customer_id"]
         to_cid = p["to_customer_id"]
-        amount = money(D(p["amount"]))
+        amount = money(decimal_value(p["amount"]))
 
         return [
             leg("2010", from_cid, debit=amount),
@@ -206,14 +226,14 @@ class Book:
     def on_fx_deposit(self, p, ev):
         cid = p["customer_id"]
 
-        market_rate = D(p["market_rate"])
-        customer_rate = D(p["customer_rate"])
+        market_rate = decimal_value(p["market_rate"])
+        customer_rate = decimal_value(p["customer_rate"])
 
         if customer_rate > market_rate:
             raise Rejected()
 
-        usd_market = money(D(p["usd_at_market_rate"]))
-        usd_customer = money(D(p["usd_at_customer_rate"]))
+        usd_market = money(decimal_value(p["usd_at_market_rate"]))
+        usd_customer = money(decimal_value(p["usd_at_customer_rate"]))
         spread = money(usd_market - usd_customer)
 
         return [
@@ -225,7 +245,7 @@ class Book:
     def on_withdrawal_requested(self, p, ev):
         withdrawal_id = p["withdrawal_id"]
         cid = p["customer_id"]
-        amount = money(D(p["amount"]))
+        amount = money(decimal_value(p["amount"]))
 
         if withdrawal_id in self.withdrawals:
             raise Rejected()
@@ -364,10 +384,10 @@ class Book:
         cid = p["customer_id"]
         side = p["side"]
         symbol = p["symbol"]
-        quantity = D(p["quantity"])
-        limit_price = D(p["limit_price"])
+        quantity = decimal_value(p["quantity"])
+        limit_price = decimal_value(p["limit_price"])
         asset_class = p["asset_class"]
-        est_charges = money(D(p["est_charges"]))
+        est_charges = money(decimal_value(p["est_charges"]))
 
         if side not in ("buy", "sell"):
             raise Rejected()
@@ -470,8 +490,8 @@ class Book:
     def _add_buy_lot(self, p, ev):
         cid = p["customer_id"]
         symbol = p["symbol"]
-        quantity = D(p["quantity"])
-        cost = money(D(p["principal"]))
+        quantity = decimal_value(p["quantity"])
+        cost = money(decimal_value(p["principal"]))
 
         if quantity <= ZERO:
             raise Rejected()
@@ -560,7 +580,7 @@ class Book:
 
     def _buy_fill_legs(self, p):
         cid = p["customer_id"]
-        principal = money(D(p["principal"]))
+        principal = money(decimal_value(p["principal"]))
 
         fees = self._trade_fees(
             principal,
@@ -606,7 +626,7 @@ class Book:
 
     def _sell_fill_legs(self, p, fifo_cost):
         cid = p["customer_id"]
-        principal = money(D(p["principal"]))
+        principal = money(decimal_value(p["principal"]))
         fifo_cost = money(fifo_cost)
 
         fees = self._trade_fees(
@@ -668,7 +688,7 @@ class Book:
         if p["side"] != order["side"]:
             raise Rejected()
 
-        fill_quantity = D(p["quantity"])
+        fill_quantity = decimal_value(p["quantity"])
 
         if fill_quantity <= ZERO:
             raise Rejected()
@@ -733,7 +753,7 @@ class Book:
         if p["side"] != order["side"]:
             raise Rejected()
 
-        fill_quantity = D(p["quantity"])
+        fill_quantity = decimal_value(p["quantity"])
 
         if fill_quantity <= ZERO:
             raise Rejected()
@@ -791,7 +811,7 @@ class Book:
         if side not in ("buy", "sell"):
             raise Rejected()
 
-        principal = money(D(p["principal"]))
+        principal = money(decimal_value(p["principal"]))
         if principal <= ZERO:
             raise Rejected()
 
@@ -801,7 +821,7 @@ class Book:
 
         trade_id = p["trade_id"]
         side = p["side"]
-        principal = money(D(p["principal"]))
+        principal = money(decimal_value(p["principal"]))
 
         self.trades[trade_id] = {
             "trade_id": trade_id,
@@ -937,9 +957,9 @@ class Book:
     def on_dividend_cash(self, p, ev):
         cid = p["customer_id"]
 
-        gross = money(D(p["gross_amount"]))
-        withholding = money(D(p["withholding_tax"]))
-        net = money(D(p["net_amount"]))
+        gross = money(decimal_value(p["gross_amount"]))
+        withholding = money(decimal_value(p["withholding_tax"]))
+        net = money(decimal_value(p["net_amount"]))
 
         if gross <= ZERO or withholding < ZERO or net <= ZERO:
             raise Rejected()
@@ -957,12 +977,12 @@ class Book:
         cid = p["customer_id"]
         symbol = p["symbol"]
 
-        gross = money(D(p["gross_amount"]))
-        withholding = money(D(p["withholding_tax"]))
-        net = money(D(p["net_amount"]))
+        gross = money(decimal_value(p["gross_amount"]))
+        withholding = money(decimal_value(p["withholding_tax"]))
+        net = money(decimal_value(p["net_amount"]))
 
-        reinvest_price = D(p["reinvest_price"])
-        reinvest_quantity = D(p["reinvest_quantity"])
+        reinvest_price = decimal_value(p["reinvest_price"])
+        reinvest_quantity = decimal_value(p["reinvest_quantity"])
 
         if gross <= ZERO:
             raise Rejected()
@@ -1000,8 +1020,8 @@ class Book:
         cid = p["customer_id"]
         symbol = p["symbol"]
 
-        ratio_from = D(p["ratio_from"])
-        ratio_to = D(p["ratio_to"])
+        ratio_from = decimal_value(p["ratio_from"])
+        ratio_to = decimal_value(p["ratio_to"])
 
         if ratio_from <= ZERO or ratio_to <= ZERO:
             raise Rejected()
@@ -1176,12 +1196,3 @@ class Book:
                 for cid in sorted(customers)
             },
         }
-
-
-class Rejected(Exception):
-    """Raise from a handler for an event you refuse to post.
-
-    An oversell, a reversal of something you never received, a payload that
-    will not parse. Rejecting one event and carrying on beats stopping: a
-    server that stalls misses everything after it.
-    """
