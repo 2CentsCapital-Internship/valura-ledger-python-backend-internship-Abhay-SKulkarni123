@@ -108,6 +108,10 @@ class Book:
         self.orders: dict[str, dict] = {}
         self.lots: dict[tuple[str, str], list[dict]] = defaultdict(list)
         self.trades: dict[str, dict] = {}
+        # First-delivery history for historical/as-of checkpoints.
+        # Duplicate replays are deliberately not appended.
+        self.event_history: list[dict] = []
+        self.event_history_index: dict[str, int] = {}
 
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -121,6 +125,8 @@ class Book:
         if eid in self.seen:
             return []                      # already posted; nothing new happens
         self.seen.add(eid)
+        self.event_history_index[eid] = len(self.event_history)
+        self.event_history.append(ev)
 
         handler = getattr(self, "on_" + ev["type"], None)
         if handler is None:
@@ -351,6 +357,43 @@ class Book:
             "partner_share": partner_share,
             "broker_payable_account": tariff["payable_account"],
         }
+
+    def _route_order(self, asset_class, quantity, limit_price):
+        """Choose the eligible broker with the lowest customer charge.
+
+        Routing compares brokerage + custody using the order's
+        quantity * limit_price. Ties break by broker id ascending.
+        """
+        principal = money(D(quantity) * D(limit_price))
+
+        candidates = []
+
+        for broker, tariff in TARIFFS.items():
+            if asset_class not in tariff["asset_classes"]:
+                continue
+
+            brokerage = money(
+                max(
+                    principal * tariff["brokerage_bps"] * BPS,
+                    tariff["min_fee"],
+                )
+            )
+
+            custody = money(
+                principal * tariff["custody_bps"] * BPS
+            )
+
+            customer_charge = brokerage + custody
+
+            candidates.append((customer_charge, broker))
+
+        if not candidates:
+            raise Rejected()
+
+        # Tuple ordering gives us:
+        # 1. lowest customer charge
+        # 2. broker id ascending on ties
+        return min(candidates)[1]
 
     def _owned_quantity(self, customer_id, symbol):
         quantity = ZERO
@@ -1142,6 +1185,20 @@ class Book:
             for symbol in sorted(positions)
         }
 
+    def snapshot_as_of(self, event_id: str) -> dict:
+        """Reconstruct state immediately after event_id's first delivery."""
+        index = self.event_history_index.get(event_id)
+
+        if index is None:
+            raise Rejected()
+
+        replay = Book()
+
+        for ev in self.event_history[:index + 1]:
+            replay.apply(ev)
+
+        return replay.snapshot()
+
     # -- reporting ----------------------------------------------------------
     def snapshot(self) -> dict:
         """What a checkpoint_request wants: your whole state, right now.
@@ -1186,6 +1243,18 @@ class Book:
                 "positions": self._positions_for_customer(cid),
             }
 
+        open_order_routes = {}
+
+        for order_id, order in self.orders.items():
+            if order["status"] != "open":
+                continue
+
+            open_order_routes[order_id] = self._route_order(
+                order["asset_class"],
+                order["remaining_quantity"],
+                order["limit_price"],
+            )
+
         return {
             "trial_balance": {
                 acct: str(money(value))
@@ -1194,5 +1263,9 @@ class Book:
             "customers": {
                 cid: customers[cid]
                 for cid in sorted(customers)
+            },
+            "open_order_routes": {
+                order_id: open_order_routes[order_id]
+                for order_id in sorted(open_order_routes)
             },
         }

@@ -329,6 +329,7 @@ class TestCashEvents(unittest.TestCase):
             {
                 "trial_balance": {},
                 "customers": {},
+                "open_order_routes": {},
             },
         )
 
@@ -3898,6 +3899,273 @@ class TestCheckpointState(unittest.TestCase):
             list(first["customers"].keys()),
             ["C1", "C2"],
         )
+
+class TestOpenOrderRouting(unittest.TestCase):
+    def test_open_order_route_chooses_cheapest_eligible_broker(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "route-order-1",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "O1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        self.assertEqual(
+            b.snapshot()["open_order_routes"],
+            {"O1": "BRK-A"},
+        )
+
+    def test_routes_respect_asset_class(self):
+        b = Book()
+
+        cases = [
+            ("O-EQ", "equity", "BRK-A"),
+            ("O-ETF", "etf", "BRK-A"),
+            ("O-BOND", "bond", "BRK-C"),
+        ]
+
+        for i, (order_id, asset_class, _expected) in enumerate(cases):
+            b.apply({
+                "event_id": f"route-{i}",
+                "type": "order_placed",
+                "payload": {
+                    "order_id": order_id,
+                    "customer_id": "C1",
+                    "side": "buy",
+                    "symbol": f"SYM{i}",
+                    "quantity": "10",
+                    "limit_price": "100.00",
+                    "asset_class": asset_class,
+                    "est_charges": "10.00",
+                },
+            })
+
+        routes = b.snapshot()["open_order_routes"]
+
+        for order_id, _asset_class, expected in cases:
+            self.assertEqual(routes[order_id], expected)
+
+    def test_closed_order_is_not_reported_in_routes(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "route-place",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "O1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        self.assertIn("O1", b.snapshot()["open_order_routes"])
+
+        b.apply({
+            "event_id": "route-cancel",
+            "type": "order_cancelled",
+            "payload": {
+                "order_id": "O1",
+            },
+        })
+
+        self.assertNotIn(
+            "O1",
+            b.snapshot()["open_order_routes"],
+        )
+
+    def test_routing_uses_remaining_quantity_after_partial_fill(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "route-place-partial",
+            "type": "order_placed",
+            "payload": {
+                "order_id": "O1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "10",
+                "limit_price": "100.00",
+                "asset_class": "equity",
+                "est_charges": "10.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "route-partial-fill",
+            "type": "order_partially_filled",
+            "payload": {
+                "order_id": "O1",
+                "customer_id": "C1",
+                "side": "buy",
+                "symbol": "ACME",
+                "quantity": "4",
+                "price": "100.00",
+                "principal": "400.00",
+                "asset_class": "equity",
+                "broker": "BRK-A",
+                "partner_rate": "0.50",
+                "trade_id": "ROUTE-T1",
+            },
+        })
+
+        expected = b._route_order(
+            "equity",
+            "6",
+            "100.00",
+        )
+
+        self.assertEqual(
+            b.snapshot()["open_order_routes"]["O1"],
+            expected,
+        )
+
+class TestHistoricalCheckpoints(unittest.TestCase):
+    def test_snapshot_as_of_excludes_later_events(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "hist-d1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "hist-d2",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "50.00",
+            },
+        })
+
+        historical = b.snapshot_as_of("hist-d1")
+
+        self.assertEqual(
+            historical["customers"]["C1"]["wallet_cash"],
+            "100.00",
+        )
+
+        self.assertEqual(
+            b.snapshot()["customers"]["C1"]["wallet_cash"],
+            "150.00",
+        )
+
+    def test_snapshot_as_of_rejected_event_preserves_delivery_position(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "hist-good",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "hist-bad",
+            "type": "fee_charged",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "not-a-number",
+            },
+        })
+
+        b.apply({
+            "event_id": "hist-later",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "50.00",
+            },
+        })
+
+        historical = b.snapshot_as_of("hist-bad")
+
+        self.assertEqual(
+            historical["customers"]["C1"]["wallet_cash"],
+            "100.00",
+        )
+
+    def test_duplicate_delivery_does_not_move_historical_position(self):
+        b = Book()
+
+        first = {
+            "event_id": "hist-dup",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        }
+
+        b.apply(first)
+
+        b.apply({
+            "event_id": "hist-middle",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "50.00",
+            },
+        })
+
+        # Deliberate replay.
+        b.apply(first)
+
+        self.assertEqual(len(b.event_history), 2)
+
+        historical = b.snapshot_as_of("hist-dup")
+
+        self.assertEqual(
+            historical["customers"]["C1"]["wallet_cash"],
+            "100.00",
+        )
+
+    def test_snapshot_as_of_does_not_mutate_live_book(self):
+        b = Book()
+
+        b.apply({
+            "event_id": "hist-1",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "100.00",
+            },
+        })
+
+        b.apply({
+            "event_id": "hist-2",
+            "type": "deposit",
+            "payload": {
+                "customer_id": "C1",
+                "amount": "25.00",
+            },
+        })
+
+        before = b.snapshot()
+
+        b.snapshot_as_of("hist-1")
+
+        self.assertEqual(b.snapshot(), before)
 
 if __name__ == "__main__":
     unittest.main()
