@@ -134,6 +134,15 @@ class Book:
             return []
         try:
             legs = handler(ev["payload"], ev) or []
+
+            legs = [
+                item for item in legs
+                if not (
+                    money(D(item["debit"])) == ZERO
+                    and money(D(item["credit"])) == ZERO
+                )
+            ]
+
         except NotImplementedError:
             # Not written yet. Submit nothing for it and carry on, so one
             # missing handler costs you that event rather than the whole run.
